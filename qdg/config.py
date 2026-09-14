@@ -51,6 +51,9 @@ def validate_config(config):
     for key in ("quaternions", "kernel", "depth", "stem_stride"):
         if not isinstance(model[key], int) or model[key] < 1:
             raise ValueError(f"model.{key} must be a positive integer")
+    for key in ("real_width", "raw_width", "fusion_dim"):
+        if model.get(key) is not None and (not isinstance(model[key], int) or model[key] < 1):
+            raise ValueError(f"model.{key} must be a positive integer when set")
     if model["kernel"] % 2 == 0:
         raise ValueError("model.kernel must be odd so padding keeps the length")
     if (10 * data["sampling_rate"]) % (model["stem_stride"] * 2 ** (model["depth"] - 1)):

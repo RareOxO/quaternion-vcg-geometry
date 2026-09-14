@@ -6,6 +6,15 @@
     M3  first-order at 10/20/40/80 ms            quaternion encoder
     M4  M3 plus the second-order difference      quaternion encoder
 
+The fusion ladder of the 双分支 addendum keeps M0 intact as a raw branch and adds
+one of M1-M4 as a second branch, joined by late concatenation:
+
+    F1 = M0 + M1   F2 = M0 + M2   F3 = M0 + M3   F4 = M0 + M4
+
+M0-M4 themselves are untouched, so their published numbers stay reproducible; the
+fusion models answer a different question ("does geometry add anything on top of a
+strong raw baseline?") than M1-M0 did ("is geometry a better replacement?").
+
 Only the feature block and the interaction rule change between them. Stem depth,
 kernel, pooling, dropout, pooling-to-logits head and training recipe are shared, so
 a difference in the result table is attributable to the ablated component.
@@ -18,13 +27,18 @@ encoder has 4Q channels and the real control 2Q -- so totals stay close, not equ
 Table 3 prints the parameter count of every row for exactly this reason.
 """
 
+import torch
 from torch import nn
 
 from .data import CLASSES
 from .geometry import VCGGeometry
 from .quaternion_nn import TCNEncoder
 
-VARIANTS = ("M0", "M1", "M2", "M3", "M4")
+SINGLE_VARIANTS = ("M0", "M1", "M2", "M3", "M4")
+# F_n keeps M0 as an intact raw branch and adds M_n as a second branch (双分支方案 §2).
+FUSION_PAIRS = {"F1": "M1", "F2": "M2", "F3": "M3", "F4": "M4"}
+FUSION_VARIANTS = tuple(FUSION_PAIRS)
+VARIANTS = (*SINGLE_VARIANTS, *FUSION_VARIANTS)
 
 VARIANT_DEFAULTS = {
     "M0": {"feature": "raw", "scales_ms": [], "algebra": "real"},
@@ -35,10 +49,32 @@ VARIANT_DEFAULTS = {
 }
 
 
+def branch_configs(config):
+    """Split a fusion config into its raw (M0) and geometry (M1-M4) branch configs.
+
+    The geometry branch inherits every model key the user set, so `scales_ms`,
+    `operator` and the width settings stay under one knob; the raw branch is pinned
+    to M0's defaults so it can never be perturbed by a geometry-side override
+    (双分支方案 §4: "不要因为做 fusion 而修改 M0 branch").
+    """
+    if config["variant"] not in FUSION_VARIANTS:
+        raise ValueError(f"variant must be one of {FUSION_VARIANTS}")
+    geometry = {**config, "variant": FUSION_PAIRS[config["variant"]]}
+    raw = {
+        **config,
+        "variant": "M0",
+        **VARIANT_DEFAULTS["M0"],
+        "operator": "conv",
+        # M0 is a real encoder, so only real_width applies; keep the config's own value.
+        "real_width": config.get("raw_width") or config.get("real_width"),
+    }
+    return raw, geometry
+
+
 def model_settings(config):
     """Resolve variant defaults, letting explicit keys override them for the ablations."""
-    if config["variant"] not in VARIANTS:
-        raise ValueError(f"variant must be one of {VARIANTS}")
+    if config["variant"] not in SINGLE_VARIANTS:
+        raise ValueError(f"variant must be one of {SINGLE_VARIANTS}")
     settings = dict(VARIANT_DEFAULTS[config["variant"]])
     for key in ("feature", "scales_ms", "algebra"):
         if config.get(key) is not None:
@@ -58,7 +94,7 @@ def model_settings(config):
 
 
 class GeometryNet(nn.Module):
-    def __init__(self, config, stats):
+    def __init__(self, config, stats, classifier=True):
         super().__init__()
         settings = model_settings(config)
         self.variant, self.settings = config["variant"], settings
@@ -81,12 +117,83 @@ class GeometryNet(nn.Module):
             quaternion=quaternion,
             operator=settings["operator"],
         )
+        self.features = width
         # The head is real and identical everywhere; only the encoder is ablated.
-        self.head = nn.Linear(width, len(CLASSES))
+        # A fusion branch drops it so its parameters do not inflate the fusion count.
+        self.head = nn.Linear(width, len(CLASSES)) if classifier else None
+
+    def describe(self):
+        """Reporting surface shared with FusionNet, so the engine logs both alike."""
+        return {
+            "encoder_parameters": sum(p.numel() for p in self.encoder.parameters()),
+            "receptive_field_samples": self.encoder.receptive_field,
+            "input_channels": self.frontend.out_channels,
+        }
+
+    def forward_features(self, ecg):
+        """Pre-classifier embedding, (B, features). Used as-is by the fusion branches."""
+        return self.encoder(self.frontend(ecg)).float()
 
     def forward(self, ecg):
-        return self.head(self.encoder(self.frontend(ecg)).float())
+        if self.head is None:
+            raise RuntimeError("This model was built without a classifier head")
+        return self.head(self.forward_features(ecg))
+
+
+class FusionNet(nn.Module):
+    """M0 raw branch + an M1-M4 geometry branch, joined by late concat (双分支方案 §3).
+
+    Deliberately late fusion: each branch keeps its own stem, so an effect can be
+    attributed to the geometry features rather than to a wider first layer or a
+    larger input channel count. The join is the same for F1-F4 -- project each
+    branch to `fusion_dim`, concatenate, normalize, one linear to the classes
+    (§9) -- with no attention, gating or hidden MLP.
+    """
+
+    def __init__(self, config, stats):
+        super().__init__()
+        raw_config, geometry_config = branch_configs(config)
+        self.variant = config["variant"]
+        self.raw = GeometryNet(raw_config, stats, classifier=False)
+        self.geometry = GeometryNet(geometry_config, stats, classifier=False)
+        dim = config.get("fusion_dim") or self.raw.features
+        self.raw_project = nn.Linear(self.raw.features, dim)
+        self.geometry_project = nn.Linear(self.geometry.features, dim)
+        self.norm = nn.LayerNorm(2 * dim)
+        self.head = nn.Linear(2 * dim, len(CLASSES))
+        self.settings = {
+            "fusion_dim": dim,
+            "raw": self.raw.settings,
+            "geometry": self.geometry.settings,
+        }
+
+    def describe(self):
+        raw, geometry = self.raw.describe(), self.geometry.describe()
+        return {
+            "encoder_parameters": raw["encoder_parameters"] + geometry["encoder_parameters"],
+            "receptive_field_samples": max(
+                raw["receptive_field_samples"], geometry["receptive_field_samples"]
+            ),
+            "input_channels": {
+                "raw": raw["input_channels"],
+                "geometry": geometry["input_channels"],
+            },
+            "branch_parameters": {
+                "raw": sum(p.numel() for p in self.raw.parameters()),
+                "geometry": sum(p.numel() for p in self.geometry.parameters()),
+            },
+        }
+
+    def forward_features(self, ecg):
+        raw = self.raw_project(self.raw.forward_features(ecg))
+        geometry = self.geometry_project(self.geometry.forward_features(ecg))
+        return self.norm(torch.cat((raw, geometry), dim=-1))
+
+    def forward(self, ecg):
+        return self.head(self.forward_features(ecg))
 
 
 def build_model(config, stats):
+    if config["variant"] in FUSION_VARIANTS:
+        return FusionNet(config, stats)
     return GeometryNet(config, stats)

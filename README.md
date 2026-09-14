@@ -54,6 +54,35 @@ holds `4Q²K` weights and a real conv of width `C` holds `C²K`, so `real_width 
 equalizes them exactly (per-channel bias/gain terms leave a small remainder — Table 3
 prints every row's parameter count).
 
+## Raw + Geometry fusion (双分支 addendum)
+
+M1–M4 replace the raw signal, so M1 − M0 measures a *replacement gap*, not an added
+value. The fusion ladder keeps M0 intact as one branch and adds a geometry branch:
+
+| Model | Raw branch | Geometry branch |
+|---|---|---|
+| M0-Wide | M0 widened to 92 ch (capacity control, no geometry) | — |
+| F1 | M0 | M1 (real, 20 ms) |
+| F2 | M0 | M2 (quaternion, 20 ms) |
+| F3 | M0 | M3 (quaternion, 4 scales) |
+| F4 | M0 | M4 (+ second order) |
+
+Late fusion only: each branch keeps its own stem, so an effect is attributable to the
+geometry features rather than to a wider first layer. The join is identical for F1–F4 —
+project each branch to `fusion_dim`, concatenate, LayerNorm, one linear to the classes —
+with no attention, gating or hidden MLP. M0–M4 are untouched; their checkpoints still
+load and `runs/tables.md` is byte-stable.
+
+`M0-Wide` matches F1's parameter count to 0.09% (342,889 vs 342,597) and F4's to 2.1%,
+so `F1 − M0-Wide` separates geometry from raw capacity. Component gains are redefined:
+`F1 − M0` (real geometry complementarity), `F1 − M0-Wide` (vs extra capacity),
+`F2 − F1`, `F3 − F2`, `F4 − F3`. Results go to `runs/fusion_tables.md`.
+
+```bash
+python -m qdg suite --stage stage-a --seeds 42 43 44   # M0, M0-Wide, F1 — judge F1 first
+python -m qdg suite --stage fusion --seeds 42 43 44    # the whole ladder
+```
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five

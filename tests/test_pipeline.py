@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -91,3 +92,20 @@ def test_validate_config_rejects_bad_settings(tiny_config):
         validate_config({**tiny_config, "model": {**tiny_config["model"], "kernel": 4}})
     with pytest.raises(ValueError):
         validate_config({**tiny_config, "model": {**tiny_config["model"], "scales_ms": [20, 20]}})
+
+
+def test_fusion_tables_are_generated(synthetic_cache):
+    """双分支方案 §14-16, and tables.md must stay untouched by them."""
+    config = synthetic_cache[0]
+    for name in ("M0", "M0_wide", "F1"):
+        evaluate(train(experiment_config(config, name), run_name=f"{name}_seed42") / "best.pt")
+    root = Path(config["training"]["output"])
+    summary = tables(root)
+    assert {"M0", "M0_wide", "F1"} <= set(summary)
+    text = (root / "fusion_tables.md").read_text(encoding="utf-8")
+    assert "Table 5" in text and "Table 6" in text and "Table 7" in text
+    assert "Real geometry complementarity" in text
+    assert "Geometry vs extra capacity" in text
+    # The original four tables still exist and still describe only M0-M4.
+    original = (root / "tables.md").read_text(encoding="utf-8")
+    assert "Table 1" in original and "F1 Raw + Real Geo" not in original

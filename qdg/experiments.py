@@ -15,7 +15,7 @@ import torch
 
 from .data import CLASSES, load_manifest, save_json
 from .engine import evaluate, setup, train
-from .models import build_model
+from .models import FUSION_PAIRS, build_model
 
 # name -> model-config overrides applied on top of the base YAML.
 EXPERIMENTS = {
@@ -28,8 +28,43 @@ EXPERIMENTS = {
     "M2_s40": {"variant": "M2", "scales_ms": [40]},
     "M2_s80": {"variant": "M2", "scales_ms": [80]},
     "M1_mlp": {"variant": "M1", "operator": "mlp"},
+    # Fusion ladder (双分支方案). M0_wide is the capacity control: raw XYZ only, width
+    # solved so its parameter count lands within 0.1% of F1 and 2.1% of F4 (§10).
+    "M0_wide": {"variant": "M0", "real_width": 92},
+    "F1": {"variant": "F1"},
+    "F2": {"variant": "F2"},
+    "F3": {"variant": "F3"},
+    "F4": {"variant": "F4"},
 }
 MAIN = ("M0", "M1", "M2", "M3", "M4")
+FUSION = ("M0", "M0_wide", "F1", "F2", "F3", "F4")
+# 双分支方案 §12: train M0 / M0_wide / F1 first and stop for a decision on F1.
+FUSION_STAGE_A = ("M0", "M0_wide", "F1")
+FUSION_LABELS = {
+    "M0": "M0 Raw XYZ",
+    "M0_wide": "M0-Wide (capacity control)",
+    "F1": "F1 Raw + Real Geo",
+    "F2": "F2 Raw + Quat Geo",
+    "F3": "F3 Raw + Quat MS",
+    "F4": "F4 Raw + Full Geo",
+}
+# Raw / Geometry / Quaternion / Multi-scale / 2nd-order
+FUSION_MARKS = {
+    "M0": ("v", "x", "x", "x", "x"),
+    "M0_wide": ("v", "x", "x", "x", "x"),
+    "F1": ("v", "v", "x", "x", "x"),
+    "F2": ("v", "v", "v", "x", "x"),
+    "F3": ("v", "v", "v", "v", "x"),
+    "F4": ("v", "v", "v", "v", "v"),
+}
+# 双分支方案 §16. The old M1-M0 is explicitly NOT an "added geometry" gain.
+FUSION_GAINS = (
+    ("F1 - M0", "Real geometry complementarity", "F1", "M0"),
+    ("F1 - M0-Wide", "Geometry vs extra capacity", "F1", "M0_wide"),
+    ("F2 - F1", "Quaternion-specific increment", "F2", "F1"),
+    ("F3 - F2", "Multi-scale increment", "F3", "F2"),
+    ("F4 - F3", "Second-order increment", "F4", "F3"),
+)
 SCALE_ROWS = (
     ("10 ms", "M2_s10"),
     ("20 ms", "M2"),
@@ -80,11 +115,8 @@ def profile(config):
         rows.append(
             {
                 "experiment": name,
-                "input_channels": model.frontend.out_channels,
-                "quaternion_channels": model.frontend.quaternion_channels,
                 "parameters": sum(p.numel() for p in model.parameters()),
-                "encoder_parameters": sum(p.numel() for p in model.encoder.parameters()),
-                "receptive_field_samples": model.encoder.receptive_field,
+                **model.describe(),
                 "output_shape": list(logits.shape),
             }
         )
@@ -250,4 +282,85 @@ def tables(root):
         writer.writeheader()
         writer.writerows(rows)
     print(text, flush=True)
+    fusion_tables(root, summary)
     return summary
+
+
+def fusion_tables(root, summary):
+    """Tables 5-7 of the 双分支 addendum (§14-16), written to fusion_tables.md.
+
+    Kept in their own file so tables.md -- the M0-M4 result of the first report --
+    stays byte-stable and reproducible.
+    """
+    root = Path(root)
+    present = [name for name in FUSION if name in summary]
+    if not any(name in summary for name in ("M0_wide", *FUSION_PAIRS)):
+        return None
+    baseline = summary.get("M0")
+
+    def delta(name):
+        if baseline is None or name == "M0":
+            return "--"
+        return f"{summary[name]['macro_auroc_mean'] - baseline['macro_auroc_mean']:+.4f}"
+
+    main = _table(
+        [
+            "Model",
+            "Raw XYZ",
+            "Geometry",
+            "Quaternion",
+            "Multi-scale",
+            "2nd-order",
+            "Params",
+            "Macro AUROC",
+            "Delta vs M0",
+        ],
+        [
+            [
+                FUSION_LABELS[name],
+                *FUSION_MARKS[name],
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                delta(name),
+            ]
+            for name in present
+        ],
+    )
+    per_class = _table(
+        ["Model", "Macro AUROC", *CLASSES],
+        [
+            [FUSION_LABELS[name], _cell(summary[name], "macro_auroc")]
+            + [_cell(summary[name], cls) for cls in CLASSES]
+            for name in present
+        ],
+    )
+    gains = _table(
+        ["Comparison", "Meaning", "Delta Macro AUROC"],
+        [
+            [
+                label,
+                meaning,
+                f"{summary[new]['macro_auroc_mean'] - summary[old]['macro_auroc_mean']:+.4f}",
+            ]
+            for label, meaning, new, old in FUSION_GAINS
+            if new in summary and old in summary
+        ],
+    )
+    missing = [name for name in FUSION if name not in summary]
+    text = (
+        "# Raw VCG + Geometry fusion: PTB-XL results\n\n"
+        "Test fold 10, thresholds fixed at 0.5, mean+-std over seeds.\n"
+        "F_n = M0 raw branch + M_n geometry branch, joined by late concat.\n"
+        "M0-Wide is raw XYZ only, widened to match the fusion parameter count.\n\n"
+        "## Table 5: Fusion main results\n\n" + main + "\n\n"
+        "## Table 6: Per-class AUROC\n\n" + per_class + "\n\n"
+        "## Table 7: Component gains\n\n" + gains + "\n\n"
+        "Note: the earlier M1 - M0 is a geometry-only replacement gap, not an\n"
+        "added-geometry gain. The added-geometry effect is F1 - M0, and F1 - M0-Wide\n"
+        "is the part that survives the capacity control.\n"
+    )
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "fusion_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text

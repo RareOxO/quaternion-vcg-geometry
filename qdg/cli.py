@@ -5,7 +5,15 @@ from pathlib import Path
 from .config import load_config, validate_config
 from .data import audit, prepare
 from .engine import evaluate, train
-from .experiments import EXPERIMENTS, experiment_config, profile, suite, tables
+from .experiments import (
+    EXPERIMENTS,
+    FUSION,
+    FUSION_STAGE_A,
+    experiment_config,
+    profile,
+    suite,
+    tables,
+)
 from .sanity import check_geometry, sanity_checks
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "base.yaml"
@@ -31,7 +39,15 @@ def main():
             sub.add_argument("--limit-train", type=int)
             sub.add_argument("--limit-val", type=int)
         if command == "suite":
-            sub.add_argument("--experiments", nargs="+", choices=sorted(EXPERIMENTS))
+            group = sub.add_mutually_exclusive_group()
+            group.add_argument("--experiments", nargs="+", choices=sorted(EXPERIMENTS))
+            # 双分支方案 §12: stage-a stops after F1 so its result can be judged
+            # before F2-F4 are spent.
+            group.add_argument(
+                "--stage",
+                choices=("stage-a", "fusion"),
+                help="stage-a: M0, M0_wide, F1 only; fusion: the whole F ladder",
+            )
             sub.add_argument("--seeds", nargs="+", type=int, default=[42])
     evaluation = subparsers.add_parser("evaluate")
     evaluation.add_argument("--checkpoint", required=True, type=Path)
@@ -69,7 +85,9 @@ def main():
         elif args.command == "profile":
             result = profile(config)
         elif args.command == "suite":
-            result = suite(config, args.experiments or list(EXPERIMENTS), args.seeds)
+            stage = {"stage-a": list(FUSION_STAGE_A), "fusion": list(FUSION)}
+            names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
+            result = suite(config, names, args.seeds)
         else:
             run_dir = train(config, args.run_name, args.limit_train, args.limit_val)
             result = evaluate(run_dir / "best.pt", "test", config["training"]["device"])
