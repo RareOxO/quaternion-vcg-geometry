@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quaternion-vcg-dynamic-geometry"
+version = "0.1.0"
+description = "Explicit VCG dynamic geometry and Hamilton structured interaction on PTB-XL"
+requires-python = ">=3.11"
+dependencies = [
+  "torch==2.8.0", "numpy==2.2.6", "pandas==2.2.3", "scipy==1.15.3",
+  "scikit-learn==1.6.1", "wfdb==4.3.0", "PyYAML==6.0.2", "tqdm==4.67.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "ruff==0.12.12"]
+
+[project.scripts]
+qdg = "qdg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["qdg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

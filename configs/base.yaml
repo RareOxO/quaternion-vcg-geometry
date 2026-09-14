@@ -1,0 +1,35 @@
+# Paths resolve relative to this YAML file, independent of the working directory.
+data:
+  root: ../../datasets/physionet.org/files/ptb-xl/1.0.3
+  cache: ../artifacts/ptbxl_500_bp_0p5_100
+  sampling_rate: 500
+  bandpass: [0.5, 100.0]
+model:
+  # The experiment registry in qdg/experiments.py overrides variant/scales_ms/operator.
+  variant: M0
+  # Quaternion encoders use 4 * quaternions real channels; the real control uses
+  # real_width = 2 * quaternions, which makes the two convolution weight counts equal.
+  quaternions: 32
+  real_width: null
+  kernel: 5
+  depth: 4
+  stem_stride: 5
+  dropout: 0.1
+  # Never renormalize the relation descriptor silently; 方案 §4.3 wants this explicit.
+  renormalize: false
+training:
+  seed: 42
+  epochs: 60
+  patience: 12
+  min_delta: 0.0001
+  batch_size: 32
+  lr: 0.001
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  weighted_bce: true
+  num_workers: 4
+  cpu_threads: 4
+  amp: true
+  device: auto
+  threshold: validation_f1
+  output: ../runs
