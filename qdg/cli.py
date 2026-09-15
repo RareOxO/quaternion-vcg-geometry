@@ -123,7 +123,13 @@ def main():
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)
         else:
-            run_dir = train(config, args.run_name, args.limit_train, args.limit_val)
+            # Default the run directory to the experiment name. Without this the
+            # name comes from model.variant, and every benchmark experiment shares
+            # the variant RLAB, so the runs would be indistinguishable on disk.
+            run_name = args.run_name
+            if run_name is None and args.experiment:
+                run_name = f"{args.experiment}_seed{config['training']['seed']}"
+            run_dir = train(config, run_name, args.limit_train, args.limit_val)
             result = evaluate(run_dir / "best.pt", "test", config["training"]["device"])
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
 
