@@ -40,6 +40,11 @@ EXPERIMENTS = {
     "RA": {"variant": "RA"},
     "RU": {"variant": "RU"},
     "RLA": {"variant": "RLA"},
+    # Temporal context ablation (RLA temporal 指导书 §3). The RLA input is identical in
+    # all three; the only systematic variable is the receptive field. Widths are solved
+    # so the parameter counts stay within 1.3% of RLA-Long, which IS the existing RLA.
+    "RLA_short": {"variant": "RLA", "depth": 1, "kernel": 5, "real_width": 127},
+    "RLA_medium": {"variant": "RLA", "depth": 2, "kernel": 7, "real_width": 76},
 }
 MAIN = ("M0", "M1", "M2", "M3", "M4")
 # v2 指导书 §8: M0 and M1 are existing anchors, never retrained for this stage.
@@ -64,6 +69,15 @@ DIAGNOSTIC_DIFFS = (
 # Seed spread of the completed three-seed runs is 0.0002-0.0031 Macro AUROC, so an
 # effect under this band is not distinguishable at seed=42 only (v2 指导书 §9).
 NOISE_BAND = 0.005
+
+# RLA temporal 指导书 §3/§8. Long is the existing RLA run, never retrained (§7 step 5).
+TEMPORAL = (("RLA-Short", "RLA_short"), ("RLA-Medium", "RLA_medium"), ("RLA-Long", "RLA"))
+TEMPORAL_NEW = ("RLA_short", "RLA_medium")
+TEMPORAL_DIFFS = (
+    ("Medium - Short", "RLA_medium", "RLA_short"),
+    ("Long - Medium", "RLA", "RLA_medium"),
+    ("Long - Short", "RLA", "RLA_short"),
+)
 FUSION = ("M0", "M0_wide", "F1", "F2", "F3", "F4")
 # 双分支方案 §12: train M0 / M0_wide / F1 first and stop for a decision on F1.
 FUSION_STAGE_A = ("M0", "M0_wide", "F1")
@@ -325,6 +339,7 @@ def tables(root):
     print(text, flush=True)
     fusion_tables(root, summary)
     diagnostic_tables(root, summary)
+    temporal_tables(root, summary, encoder_stats(root))
     return summary
 
 
@@ -513,3 +528,123 @@ def diagnostic_tables(root, summary):
     (root / "diagnostic_tables.md").write_text(text, encoding="utf-8")
     print(text, flush=True)
     return text
+
+
+def encoder_stats(root):
+    """experiment name -> the receptive field each run actually recorded at train time.
+
+    Read back from environment.json rather than recomputed, so the table reports the
+    encoder that produced the number, not whatever the current config would build.
+    """
+    stats = {}
+    for path in sorted(Path(root).rglob("environment.json")):
+        environment = json.loads(path.read_text())
+        name = path.parent.name.rsplit("_seed", 1)[0]
+        samples = environment.get("receptive_field_samples")
+        if samples is None:
+            continue
+        rate = environment.get("sampling_rate", 500)
+        stats[name] = {
+            "receptive_field_samples": samples,
+            "receptive_field_ms": round(1000 * samples / rate),
+        }
+    return stats
+
+
+def temporal_tables(root, summary, stats=None):
+    """Tables of the RLA temporal 指导书 §8, written to temporal_tables.md.
+
+    The receptive field printed here is measured from the layers the encoder actually
+    applies, never asserted from the variant name (§5/§6).
+    """
+    root = Path(root)
+    if not any(name in summary for name in TEMPORAL_NEW):
+        return None
+    stats = stats or {}
+    rows, gap = [], {}
+    for label, name in TEMPORAL:
+        if name not in summary:
+            continue
+        field = stats.get(name, {})
+        rows.append(
+            [
+                label,
+                str(field.get("receptive_field_samples", "?")),
+                f"{field.get('receptive_field_ms', '?')}",
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+        )
+    main = _table(["Model", "RF (samples)", "RF (ms)", "Params", "Macro AUROC", *CLASSES], rows)
+    for label, new, old in TEMPORAL_DIFFS:
+        if new in summary and old in summary:
+            gap[label] = summary[new]["macro_auroc_mean"] - summary[old]["macro_auroc_mean"]
+    diffs = _table(
+        ["Comparison", "Delta Macro AUROC"],
+        [[label, f"{value:+.4f}"] for label, value in gap.items()],
+    )
+    per_class = ""
+    if "RLA" in summary and "RLA_short" in summary:
+        per_class = _table(
+            ["Class", "Long - Short"],
+            [
+                [cls, f"{summary['RLA'][f'{cls}_mean'] - summary['RLA_short'][f'{cls}_mean']:+.4f}"]
+                for cls in CLASSES
+            ],
+        )
+    verdict = interpret_temporal(gap)
+    text = (
+        "# RLA temporal context ablation\n\n"
+        "The RLA input is fixed and identical in all three models; the only systematic\n"
+        "variable is the receptive field, measured from the encoder's actual layers.\n"
+        f"Seed 42 only, so differences are read against a {NOISE_BAND:.4f} noise band.\n\n"
+        "## Table 10: Temporal context results\n\n" + main + "\n\n"
+        "## Table 11: Context differences\n\n"
+        + diffs
+        + "\n\n"
+        + ("## Table 12: Per-class Long - Short\n\n" + per_class + "\n\n" if per_class else "")
+        + "## Verdict\n\n"
+        + verdict
+        + "\n"
+    )
+    missing = [name for _, name in TEMPORAL if name not in summary]
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "temporal_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_temporal(gap):
+    """The §9 decision table for the temporal ablation."""
+    medium_short, long_medium = gap.get("Medium - Short"), gap.get("Long - Medium")
+    long_short = gap.get("Long - Short")
+    if long_short is None or medium_short is None or long_medium is None:
+        return "**Incomplete.** Train RLA-Short and RLA-Medium before reading a verdict."
+    band = NOISE_BAND
+    if long_short > band and medium_short > 0 and long_medium > 0:
+        return (
+            "**Longer temporal context helps.** Short < Medium < Long and the total gain "
+            f"({long_short:+.4f}) clears the {band:.3f} noise band, so temporal evolution "
+            "carries diagnostic information beyond the instantaneous R/L/A dynamics.\n\n"
+            "Next: add seeds for the Short/Long contrast, then design temporal architecture."
+        )
+    if medium_short > band and long_medium <= 0:
+        return (
+            f"**A bounded useful range.** Medium gains {medium_short:+.4f} over Short but "
+            f"Long adds {long_medium:+.4f} on top, so the value saturates rather than "
+            "growing with context.\n\nNext: design around the Medium context, not longer."
+        )
+    if abs(long_short) <= band:
+        return (
+            f"**Not supported.** Long - Short is {long_short:+.4f}, inside the "
+            f"{band:.3f} noise band, so at seed 42 the three contexts are "
+            "indistinguishable.\n\nNext: stop elaborating temporal architecture; "
+            "re-examine the representation or the task."
+        )
+    return (
+        f"**Inconclusive.** Long - Short is {long_short:+.4f} but the ordering is not "
+        "monotone, so seed 42 alone does not support a temporal claim.\n\n"
+        "Next: add seeds only if the gap sits near the noise boundary."
+    )

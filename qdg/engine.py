@@ -130,6 +130,7 @@ def train(config, run_name=None, limit_train=None, limit_val=None):
         "seed": tc["seed"],
         "settings": model.settings,
         "parameters": sum(p.numel() for p in model.parameters()),
+        "sampling_rate": manifest["stats"]["sampling_rate"],
         **model.describe(),
         "smoke_training": bool(limit_train or limit_val),
         "python": platform.python_version(),

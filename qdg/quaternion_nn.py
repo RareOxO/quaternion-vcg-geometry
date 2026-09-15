@@ -131,6 +131,21 @@ class ResidualBlock(nn.Module):
         return x + y
 
 
+def receptive_field_samples(layers):
+    """Walk the real (kernel, stride, dilation) sequence and return the RF in samples.
+
+    Ordinary RF recursion: each layer widens the field by (k-1)*dilation input samples
+    per output step, and the jump is the product of the strides before it. Pooling is a
+    layer like any other and contributes its own kernel -- the closed form this replaces
+    omitted that, which under-counted the 4-block encoder as 605 instead of 640.
+    """
+    field, jump = 1, 1
+    for kernel, stride, dilation in layers:
+        field += (kernel - 1) * dilation * jump
+        jump *= stride
+    return field
+
+
 class TCNEncoder(nn.Module):
     """Strided stem, residual blocks halving time between them, mean over time.
 
@@ -167,10 +182,15 @@ class TCNEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             ResidualBlock(width, kernel, dropout, quaternion) for _ in range(depth)
         )
-        # Block s sees units of stem_stride * 2**s samples after the s poolings before it.
-        self.receptive_field = stem_stride * (
-            1 + 2 * (kernel - 1) * sum(2**s for s in range(depth))
-        )
+        # Built from the layers this module actually applies, in order, so depth /
+        # kernel / pooling changes can never drift away from the reported number (§5).
+        layers = [(stem_stride, stem_stride, 1)]
+        for index in range(depth):
+            if index:
+                layers.append((2, 2, 1))  # avg_pool1d(2, 2) between blocks
+            layers += [(kernel, 1, 1), (kernel, 1, 1)]
+        self.layer_spec = tuple(layers)
+        self.receptive_field = receptive_field_samples(layers)
 
     def forward(self, x):
         x = self.stem(x)

@@ -113,6 +113,32 @@ python -m qdg suite --stage diagnostic --seeds 42    # R, RA, RU, RLA; M0/M1 are
 Results and the supported / partially supported / not supported verdict go to
 `runs/diagnostic_tables.md`.
 
+## RLA temporal context ablation
+
+RLA recovers M0's accuracy, so this stage fixes that representation and varies only
+how much time the model can see. Same RLA input, same head, same recipe; seed 42.
+
+| Variant | Depth | Kernel | Width | Actual RF | Params |
+|---|---|---|---|---|---|
+| RLA-Short | 1 | 5 | 127 | 45 samples, 90 ms | 168,153 |
+| RLA-Medium | 2 | 7 | 76 | 190 samples, 380 ms | 166,293 |
+| RLA-Long | 4 | 5 | 64 | 640 samples, 1280 ms | 168,453 |
+
+RLA-Long **is** the existing `RLA` experiment, so its seed-42 run is reused rather than
+retrained. Widths are solved so the parameter counts stay within 1.3% of Long, keeping
+the receptive field the only systematic variable.
+
+The receptive field is computed by `receptive_field_samples()` from the encoder's real
+`(kernel, stride, dilation)` sequence, pooling included — never asserted from a name.
+That correction is why the 4-block encoder reports 640 samples here and 605 in earlier
+notes: the closed form it replaced dropped the three `avg_pool(2,2)` layers.
+
+```bash
+python -m qdg suite --stage temporal --seeds 42   # RLA_short, RLA_medium; Long is reused
+```
+
+Results and verdict go to `runs/temporal_tables.md`.
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five

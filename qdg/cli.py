@@ -10,6 +10,7 @@ from .experiments import (
     DIAGNOSTIC_NEW,
     FUSION,
     FUSION_STAGE_A,
+    TEMPORAL_NEW,
     experiment_config,
     profile,
     suite,
@@ -55,9 +56,10 @@ def main():
             # before F2-F4 are spent.
             group.add_argument(
                 "--stage",
-                choices=("stage-a", "fusion", "diagnostic"),
+                choices=("stage-a", "fusion", "diagnostic", "temporal"),
                 help="stage-a: M0, M0_wide, F1; fusion: the F ladder; "
-                "diagnostic: R, RA, RU, RLA (M0/M1 are reused, never retrained)",
+                "diagnostic: R, RA, RU, RLA; temporal: RLA_short and RLA_medium "
+                "(anchors M0/M1/RLA are reused, never retrained)",
             )
             sub.add_argument("--seeds", nargs="+", type=int, default=[42])
     evaluation = subparsers.add_parser("evaluate")
@@ -102,6 +104,7 @@ def main():
                 "stage-a": list(FUSION_STAGE_A),
                 "fusion": list(FUSION),
                 "diagnostic": list(DIAGNOSTIC_NEW),
+                "temporal": list(TEMPORAL_NEW),
             }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)

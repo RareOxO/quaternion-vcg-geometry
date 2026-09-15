@@ -76,11 +76,15 @@ def test_encoder_shapes_and_gradients(quaternion, operator):
 
 
 def test_receptive_field_and_mlp_operator():
-    assert TCNEncoder(4, 32, kernel=5, depth=4, stem_stride=5).receptive_field == 5 + 40 * 15
-    # kernel 1 removes temporal mixing: the MLP control sees one sample per stem stride.
+    # Measured layer by layer, so the three avg_pool(2,2) stages are counted too; the
+    # closed form this replaced omitted them and reported 605 instead of 640.
+    assert TCNEncoder(4, 32, kernel=5, depth=4, stem_stride=5).receptive_field == 640
     mlp = TCNEncoder(4, 32, operator="mlp", stem_stride=5)
-    assert mlp.receptive_field == 5
+    # kernel 1 removes every *learned* temporal mixing inside the blocks, but the fixed
+    # pooling between them still aggregates across time, so the field is 40 samples
+    # (80 ms at 500 Hz), not one stem stride.
     assert all(conv.weight.shape[-1] == 1 for block in mlp.blocks for conv in block.convs)
+    assert mlp.receptive_field == 40
 
 
 def test_quaternion_encoder_rejects_misaligned_widths():
