@@ -1381,8 +1381,20 @@ def representation_ablation_tables(root, summary):
             ]
             for label, new, old, question in (
                 ("D - U", "E3_D", "E3_U", "Local angular dynamics vs absolute direction"),
-                ("Q - D", "E3_Q", "E3_D", "Half-angle rotation vs full-angle descriptor"),
-                ("Q - U", "E3_Q", "E3_U", "Rotation parameterization vs absolute direction"),
+                # The Q row is E2_RLQ whenever E* is generic, so it is looked up rather
+                # than named: a hardcoded E3_Q would silently drop these two rows.
+                (
+                    "Q - D",
+                    REPRESENTATIONS[-1][1],
+                    "E3_D",
+                    "Half-angle rotation vs full-angle descriptor",
+                ),
+                (
+                    "Q - U",
+                    REPRESENTATIONS[-1][1],
+                    "E3_U",
+                    "Rotation parameterization vs absolute direction",
+                ),
             )
             if new in summary and old in summary
         ],
@@ -1390,12 +1402,23 @@ def representation_ablation_tables(root, summary):
     missing = [name for _, name, _ in REPRESENTATIONS if name not in summary]
     text = (
         "# Experiment 3: angular representation ablation\n\n"
-        "R, L, receptive field, channel and parameter budget, fusion, head and training\n"
-        "protocol are frozen; only the angular representation changes. All three use the\n"
-        f"generic counterpart of E* ({BENCHMARK_LABELS[REPRESENTATION_ENCODER]}) on the angular\n"
-        "branch: U is a 3-vector and cannot enter a quaternion operator, and padding a\n"
-        "branch to fit one is forbidden, so holding the operator generic is what makes\n"
-        "'only the representation changes' literally true.\n\n"
+        "R, L, E*, receptive field, channel and parameter budget, fusion, head and\n"
+        "training protocol are frozen; only the angular representation changes.\n\n"
+        + (
+            f"E* ({BENCHMARK_LABELS[SELECTED_ENCODER]}) is generic, so it takes all three\n"
+            "representations directly and the R+L+Q row is the factorial's E2_RLQ, reused\n"
+            "rather than retrained.\n\n"
+            if REPRESENTATION_REUSES_FACTORIAL
+            else f"All three use the generic counterpart of E* "
+            f"({BENCHMARK_LABELS[REPRESENTATION_ENCODER]}) on the angular branch: U is a\n"
+            "3-vector and cannot enter a quaternion operator, and padding a branch to fit\n"
+            "one is forbidden, so holding the operator generic is what makes 'only the\n"
+            "representation changes' literally true.\n\n"
+        )
+        + "Q is a quaternion REPRESENTATION of the angular branch; its temporal\n"
+        "dependencies are learned by the same generic real-valued encoder as U and D.\n"
+        "This experiment compares representations, not quaternion-specific temporal\n"
+        "computation, which is what Experiment 1 tested.\n\n"
         "D and Q derive from the same (theta, n); neither carries more raw information\n"
         "than the other, and the comparison is about parameterization and empirical\n"
         f"utility only. Seed 42, screening band {NOISE_BAND:.4f}.\n\n"
