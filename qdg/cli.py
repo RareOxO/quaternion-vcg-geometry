@@ -98,6 +98,22 @@ def main():
         help=f"best.pt of the proposed model; required for the hybrid arm "
         f"(normally runs/{HANDCRAFTED_PROPOSED}_seed42/best.pt)",
     )
+    interpretability = subparsers.add_parser("interpret")
+    interpretability.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    interpretability.add_argument(
+        "--checkpoint", type=Path, required=True, help="best.pt of the full R+L+Q model"
+    )
+    interpretability.add_argument("--device")
+    interpretability.add_argument("--output", type=Path)
+    interpretability.add_argument("--window-ms", type=int, default=20)
+    interpretability.add_argument("--stride-ms", type=int, default=10)
+    interpretability.add_argument(
+        "--quaternion-mode",
+        choices=("interpolate", "identity"),
+        default="interpolate",
+        help="SLERP between the boundary rotations, or the identity-rotation robustness check",
+    )
+    interpretability.add_argument("--limit", type=int)
     evaluation = subparsers.add_parser("evaluate")
     evaluation.add_argument("--checkpoint", required=True, type=Path)
     evaluation.add_argument("--split", choices=("val", "test"), default="test")
@@ -107,6 +123,20 @@ def main():
     report.add_argument("--root", required=True, type=Path)
     args = parser.parse_args()
 
+    if args.command == "interpret":
+        from .interpret import run as run_interpret
+
+        result = run_interpret(
+            load_config(args.config),
+            args.checkpoint,
+            output=args.output,
+            device=args.device,
+            window_ms=args.window_ms,
+            stride_ms=args.stride_ms,
+            quaternion_mode=args.quaternion_mode,
+            limit=args.limit,
+        )
+        return
     if args.command == "handcrafted":
         from .classical import run_classical
 

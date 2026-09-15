@@ -541,6 +541,12 @@ class BranchedRLANet(nn.Module):
             for branch in targets:
                 if branch in features:
                     features[branch] = self.shuffle(features[branch], index)
+        return self.fuse(features)
+
+    def fuse(self, features):
+        """Branch features -> fused embedding. Separated from `forward_features` so the
+        interpretability analysis can perturb one branch and rejoin without recomputing
+        the frontends for every window."""
         parts = [
             self.projections[branch](self.encoders[branch](features[branch]).float())
             for branch in self.branches
