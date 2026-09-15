@@ -22,6 +22,7 @@ qdg = "qdg.cli:main"
 include = ["qdg*"]
 
 [tool.pytest.ini_options]
+filterwarnings = ["ignore:enable_nested_tensor:UserWarning"]
 testpaths = ["tests"]
 
 [tool.ruff]

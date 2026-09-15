@@ -5,3 +5,5 @@ __pycache__/
 artifacts/
 runs/
 runs_suite.log
+old_version/
+references/*.pdf

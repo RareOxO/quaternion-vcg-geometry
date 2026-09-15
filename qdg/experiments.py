@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from .data import CLASSES, load_manifest, save_json
+from .encoders import ENCODERS, QUATERNION_ENCODERS, QUATERNION_PAIR
 from .engine import evaluate, setup, train
 from .models import ANGULAR_BLOCKS, FUSION_PAIRS, SINGLE_VARIANTS, build_model
 from .quaternion_nn import receptive_field_samples
@@ -59,6 +60,19 @@ EXPERIMENTS = {
         "angular_algebra": "quaternion",
         "angular_quaternions": 22,
         "branch_width": 32,
+    },
+    # Experiment 1: temporal encoder benchmark (R/L/Q Long-Context plan section 2).
+    # R + L + Q with Q frozen as the rotation quaternion; only the encoder changes.
+    **{
+        f"E1_{name}": {
+            "variant": "RLAB",
+            "encoder": name,
+            "angular_algebra": "standard",
+            "angular_blocks": ["rotation"],
+            "angular_quaternions": 22,
+            "branch_width": 32,
+        }
+        for name in ENCODERS
     },
     # Temporal evolution of the angular representation (Temporal evolution 方案 §3).
     # All three use the SAME plain real temporal encoder; only the angular input changes.
@@ -109,6 +123,22 @@ TEMPORAL_DIFFS = (
 # separable angular encoder, so it does not meet the §6 reuse condition.
 ANGULAR = (("RLA-Standard", "RLA_standard"), ("RLA-Quaternion", "RLA_quaternion"))
 ANGULAR_NEW = ("RLA_standard", "RLA_quaternion")
+
+# Experiment 1 of the R/L/Q Long-Context plan. E* is chosen on validation Macro AUROC,
+# then Macro AUPRC, then the smaller parameter count (section 2.2).
+BENCHMARK = tuple(f"E1_{name}" for name in ENCODERS)
+BENCHMARK_LABELS = {
+    "lstm": "LSTM",
+    "gru": "GRU",
+    "lstm_attention": "LSTM + Attention",
+    "tcn": "TCN",
+    "tcn_attention": "TCN + Attention",
+    "transformer": "Transformer",
+    "qlstm": "QLSTM",
+    "qtcn": "QTCN",
+    "qtransformer": "Q-Transformer",
+    "qgnn": "QGNN",
+}
 
 # Angular representation 指导书 §2. Both runs already exist: the baseline is the
 # full-angle control of the operator round, and the new variant is the registry's A0,
@@ -399,6 +429,7 @@ def tables(root):
     angular_tables(root, summary, angular_stats(root))
     evolution_tables(root, summary, angular_stats(root))
     representation_tables(root, summary, angular_stats(root))
+    benchmark_tables(root, summary, angular_stats(root))
     return summary
 
 
@@ -834,7 +865,7 @@ def angular_stats(root):
         stats[path.parent.name.rsplit("_seed", 1)[0]] = {
             "angular_parameters": environment["angular_parameters"],
             "receptive_field_samples": samples,
-            "receptive_field_ms": round(1000 * samples / rate),
+            "receptive_field_ms": round(1000 * samples / rate) if samples else None,
         }
     return stats
 
@@ -1059,3 +1090,91 @@ def interpret_representation(gap):
         "channels -- a low-cost seeds 43/44 confirmation is a defensible option, but "
         "that is a separate decision, not an automatic follow-on."
     )
+
+
+def benchmark_tables(root, summary, encoders=None):
+    """Experiment 1 table and the E* selection rule (plan section 2.2).
+
+    Selection is validation Macro AUROC, then validation Macro AUPRC, then the smaller
+    parameter count. Test metrics are reported but never used to select.
+    """
+    root = Path(root)
+    present = [name for name in BENCHMARK if name in summary]
+    if not present:
+        return None
+    encoders = encoders or {}
+
+    def field(name):
+        milliseconds = encoders.get(name, {}).get("receptive_field_ms")
+        return f"{milliseconds} ms" if milliseconds else "global"
+
+    rows = []
+    for name in present:
+        short = name[len("E1_") :]
+        rows.append(
+            [
+                BENCHMARK_LABELS[short],
+                "quaternion" if short in QUATERNION_ENCODERS else "generic",
+                f"{summary[name]['parameters']:,}",
+                field(name),
+                _cell(summary[name], "macro_auroc"),
+                _cell(summary[name], "macro_auprc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+        )
+    main = _table(
+        ["Encoder", "Family", "Params", "RF", "Macro AUROC", "Macro AUPRC", *CLASSES], rows
+    )
+    best = select_encoder(summary)
+    pairs = _table(
+        ["Quaternion encoder", "Matched generic", "Delta Macro AUROC"],
+        [
+            [
+                BENCHMARK_LABELS[q],
+                BENCHMARK_LABELS[QUATERNION_PAIR[q]],
+                f"{summary[f'E1_{q}']['macro_auroc_mean'] - summary[f'E1_{QUATERNION_PAIR[q]}']['macro_auroc_mean']:+.4f}",
+            ]
+            for q in QUATERNION_ENCODERS
+            if f"E1_{q}" in summary and f"E1_{QUATERNION_PAIR[q]}" in summary
+        ],
+    )
+    missing = [name for name in BENCHMARK if name not in summary]
+    text = (
+        "# Experiment 1: temporal encoder benchmark\n\n"
+        "R + L + Q with Q frozen as the rotation quaternion. Preprocessing, split,\n"
+        "fusion, head and optimisation are identical; only the temporal encoder changes.\n"
+        "R and L are always real: a quaternion encoder replaces the Q-branch operator\n"
+        "only, and its R/L branches use the matched generic encoder, so each\n"
+        "quaternion/generic pair differs in exactly one thing (plan section 2.1).\n\n"
+        "Selection rule: validation Macro AUROC, then validation Macro AUPRC, then the\n"
+        "smaller parameter count. Test metrics below are reported, never used to select.\n\n"
+        "## Table E1.1: Encoder benchmark\n\n" + main + "\n\n"
+        "## Table E1.2: Quaternion vs its matched generic encoder\n\n" + pairs + "\n\n"
+        f"## Selected encoder\n\n**E\\* = {best}**\n"
+    )
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "benchmark_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def select_encoder(summary):
+    """E* under the pre-specified rule; validation metrics only (plan section 2.2)."""
+    present = [name for name in BENCHMARK if name in summary]
+    if not present:
+        return "not selected: no benchmark runs"
+    if len(present) < len(BENCHMARK):
+        return f"not selected: {len(present)}/{len(BENCHMARK)} encoders trained"
+
+    def key(name):
+        row = summary[name]
+        return (
+            -row["validation_macro_auroc_mean"],
+            -row["validation_macro_auprc_mean"],
+            row["parameters"],
+        )
+
+    if any("validation_macro_auroc_mean" not in summary[name] for name in present):
+        return "not selected: validation metrics missing from the run summaries"
+    return BENCHMARK_LABELS[min(present, key=key)[len("E1_") :]]

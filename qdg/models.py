@@ -31,6 +31,7 @@ import torch
 from torch import nn
 
 from .data import CLASSES
+from .encoders import branch_encoder, build_encoder, encoder_widths
 from .geometry import VCGGeometry
 from .quaternion_nn import TCNEncoder
 
@@ -302,17 +303,36 @@ class BranchedRLANet(nn.Module):
             "stem_stride": config["stem_stride"],
             "dropout": config["dropout"],
         }
-        self.encoders = nn.ModuleDict(
-            {
-                block: TCNEncoder(
-                    self.frontends[block].out_channels,
-                    angular_width if block == "angular" else branch_width,
-                    quaternion=(block == "angular" and algebra == "quaternion"),
-                    **shared,
-                )
-                for block in BRANCH_BLOCKS
-            }
-        )
+        # `encoder` selects a benchmark temporal encoder (Experiment 1). Left unset, the
+        # model is exactly the TCN-based one the earlier rounds trained, so every
+        # existing variant and checkpoint is unaffected.
+        encoder = config.get("encoder")
+        if encoder:
+            angular_width, branch_width = encoder_widths(encoder, 4 * quaternions)
+            body = {k: v for k, v in shared.items() if k != "stem_stride"}
+            self.encoders = nn.ModuleDict(
+                {
+                    block: build_encoder(
+                        branch_encoder(encoder, block),
+                        self.frontends[block].out_channels,
+                        angular_width if block == "angular" else branch_width,
+                        **body,
+                    )
+                    for block in BRANCH_BLOCKS
+                }
+            )
+        else:
+            self.encoders = nn.ModuleDict(
+                {
+                    block: TCNEncoder(
+                        self.frontends[block].out_channels,
+                        angular_width if block == "angular" else branch_width,
+                        quaternion=(block == "angular" and algebra == "quaternion"),
+                        **shared,
+                    )
+                    for block in BRANCH_BLOCKS
+                }
+            )
         dim = config.get("fusion_dim") or branch_width
         self.projections = nn.ModuleDict(
             {block: nn.Linear(self.encoders[block].width, dim) for block in BRANCH_BLOCKS}
@@ -320,6 +340,10 @@ class BranchedRLANet(nn.Module):
         self.norm = nn.LayerNorm(len(BRANCH_BLOCKS) * dim)
         self.head = nn.Linear(len(BRANCH_BLOCKS) * dim, len(CLASSES))
         self.settings = {
+            "encoder": encoder,
+            "branch_encoders": {b: branch_encoder(encoder, b) for b in BRANCH_BLOCKS}
+            if encoder
+            else None,
             "angular_algebra": algebra,
             "angular_quaternions": quaternions,
             "angular_width": angular_width,
@@ -335,8 +359,11 @@ class BranchedRLANet(nn.Module):
         return sum(p.numel() for p in self.encoders["angular"].parameters())
 
     def describe(self):
+        # A recurrent or globally-attending encoder has no finite field; report None
+        # rather than inventing a number. Branch fields must still agree when defined.
         fields = {block: encoder.receptive_field for block, encoder in self.encoders.items()}
-        if len(set(fields.values())) != 1:
+        defined = {value for value in fields.values() if value is not None}
+        if len(defined) > 1:
             raise ValueError(f"Branch receptive fields must match, got {fields}")
         return {
             "encoder_parameters": sum(p.numel() for p in self.encoders.parameters()),

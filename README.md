@@ -204,6 +204,47 @@ python -m qdg suite --stage evolution --seeds 42
 
 Results and verdict go to `runs/evolution_tables.md`.
 
+## Experiment 1: temporal encoder benchmark
+
+R + L + Q with Q frozen as the rotation quaternion; only the temporal encoder changes.
+Every encoder shares one downsampling stem (stride 5 then three poolings: 5000 samples
+become 125 steps of 80 ms), the same fusion, head and recipe.
+
+| Encoder | Family | Params | Field |
+|---|---|---|---|
+| LSTM / GRU / LSTM+Attention | generic | 56.5k / 44.7k / 62.6k | global |
+| TCN / TCN+Attention | generic | 244.5k / 250.6k | 2640 ms |
+| Transformer | generic | 217.2k | global |
+| QLSTM | quaternion | 58.0k | global |
+| QTCN | quaternion | 245.8k | 2640 ms |
+| Q-Transformer | quaternion | 224.9k | global |
+| QGNN | quaternion | 183.4k | 2640 ms |
+
+**R and L are always real** (plan §2.1): a quaternion encoder replaces the Q-branch
+operator only, and its R/L branches use the matched generic encoder, so each pair —
+`lstm`/`qlstm`, `tcn`/`qtcn`, `transformer`/`qtransformer`, `tcn`/`qgnn` — differs in
+exactly one thing.
+
+`QLSTM` is the **quaternion** LSTM of Parcollet et al. (QRNN, ICLR 2019;
+arXiv:1811.02566), whose gates run through the Hamilton product with split sigmoid/tanh
+activations and component-wise gating. It is unrelated to the quantum LSTM that shares
+the abbreviation; the quantum paper in `references/` is not used.
+
+QTCN, Q-Transformer and QGNN adapt the operator structure of the SELD, QFormer and
+QSTGNN papers to a 1-D `(B, 4Q, T)` sequence. None is a reimplementation of its
+original pipeline, and QGNN uses the minimal sequence-to-graph mapping the plan allows:
+node `t` is `q_t`, joined to its four neighbours on each side.
+
+E\* is selected on validation Macro AUROC, then validation Macro AUPRC, then the smaller
+parameter count. Test metrics are reported but never used to select.
+
+```bash
+python -m qdg suite --stage benchmark --seeds 42     # all ten
+python -m qdg train --experiment E1_qlstm            # or one at a time
+```
+
+Results go to `runs/benchmark_tables.md`.
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five

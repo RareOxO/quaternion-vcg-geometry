@@ -6,10 +6,11 @@ from .config import load_config, validate_config
 from .data import audit, prepare
 from .engine import evaluate, train
 from .experiments import (
-    EXPERIMENTS,
     ANGULAR_NEW,
-    EVOLUTION_NEW,
+    BENCHMARK,
     DIAGNOSTIC_NEW,
+    EVOLUTION_NEW,
+    EXPERIMENTS,
     FUSION,
     FUSION_STAGE_A,
     TEMPORAL_NEW,
@@ -58,7 +59,15 @@ def main():
             # before F2-F4 are spent.
             group.add_argument(
                 "--stage",
-                choices=("stage-a", "fusion", "diagnostic", "temporal", "angular", "evolution"),
+                choices=(
+                    "stage-a",
+                    "fusion",
+                    "diagnostic",
+                    "temporal",
+                    "angular",
+                    "evolution",
+                    "benchmark",
+                ),
                 help="stage-a: M0, M0_wide, F1; fusion: the F ladder; "
                 "diagnostic: R, RA, RU, RLA; temporal: RLA_short and RLA_medium "
                 "(anchors M0/M1/RLA are reused, never retrained)",
@@ -109,6 +118,7 @@ def main():
                 "temporal": list(TEMPORAL_NEW),
                 "angular": list(ANGULAR_NEW),
                 "evolution": list(EVOLUTION_NEW),
+                "benchmark": list(BENCHMARK),
             }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)
