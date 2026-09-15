@@ -197,13 +197,20 @@ def test_combined_runs_and_trains(full_config):
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 
-def test_single_context_models_are_unwrapped(full_config):
-    """MultiContextEncoder with one member must behave exactly as before."""
-    for name in ("E2_RLQ", "E4_320ms", "E1_lstm_attention"):
+def test_single_context_models_keep_their_parameter_names(full_config):
+    """A single context must NOT be wrapped.
+
+    The wrapper inserts a "members.0." level into every parameter name, so wrapping a
+    single-context model would make every checkpoint trained before Experiment 6
+    existed unloadable. This is the regression that guards it.
+    """
+    for name in ("E2_RLQ", "E4_320ms", "E1_lstm_attention", "E7_q_full", "E3_U"):
         model = _model(full_config, name)
+        assert not any("members." in key for key in model.state_dict()), name
         for encoder in model.encoders.values():
-            assert len(encoder.members) == 1
-            assert encoder.width == encoder.members[0].width
+            assert not hasattr(encoder, "members")
+    combined = _model(full_config, COMBINED)
+    assert any("members." in key for key in combined.state_dict())
 
 
 def test_verdicts():

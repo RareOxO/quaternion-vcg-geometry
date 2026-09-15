@@ -430,23 +430,24 @@ class BranchedRLANet(nn.Module):
                 context_steps.append(int(value / step_ms))
             body.update(stem=stem)
             self.context_steps = context_steps
-            self.encoders = nn.ModuleDict(
-                {
-                    branch: MultiContextEncoder(
-                        [
-                            build_encoder(
-                                branch_encoder(encoder, branch),
-                                self.frontends[branch].out_channels,
-                                angular_width if branch == "angular" else branch_width,
-                                context_steps=steps,
-                                **body,
-                            )
-                            for steps in context_steps
-                        ]
+
+            def _branch(branch):
+                built = [
+                    build_encoder(
+                        branch_encoder(encoder, branch),
+                        self.frontends[branch].out_channels,
+                        angular_width if branch == "angular" else branch_width,
+                        context_steps=steps,
+                        **body,
                     )
-                    for branch in branches
-                }
-            )
+                    for steps in context_steps
+                ]
+                # A single context keeps the encoder unwrapped. The wrapper would insert
+                # a "members.0." level into every parameter name, which would make every
+                # checkpoint trained before Experiment 6 existed unloadable.
+                return built[0] if len(built) == 1 else MultiContextEncoder(built)
+
+            self.encoders = nn.ModuleDict({branch: _branch(branch) for branch in branches})
         else:
             self.encoders = nn.ModuleDict(
                 {

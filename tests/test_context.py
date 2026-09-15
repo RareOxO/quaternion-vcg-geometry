@@ -57,12 +57,10 @@ def test_context_maps_to_whole_stem_steps(full_config):
     """20 ms per step, so every level is a whole number of resets."""
     for label, context in CONTEXT_LEVELS:
         model = _model(full_config, f"E4_{label}")
-        # context_steps is a list because Experiment 6 runs two scales at once; here
-        # every level is a single scale, so each branch carries exactly one.
-        steps = {branch: tuple(encoder.context_steps) for branch, encoder in model.encoders.items()}
+        steps = {branch: encoder.context_steps for branch, encoder in model.encoders.items()}
         # Every branch carries the same restriction, so they stay temporally aligned.
         assert len(set(steps.values())) == 1, steps
-        assert steps["angular"] == ((None,) if context is None else (context // CONTEXT_STEP_MS,))
+        assert steps["angular"] == (None if context is None else context // CONTEXT_STEP_MS)
         assert model.settings["context_ms"] == context
 
 
@@ -125,7 +123,7 @@ def test_restriction_is_off_outside_experiment_4(full_config):
         assert model.settings["context_ms"] is None
         assert model.settings["stem"] is None
         for encoder in model.encoders.values():
-            assert encoder.context_steps == [None]
+            assert encoder.context_steps is None
 
 
 @pytest.mark.parametrize("name", CONTEXT)
