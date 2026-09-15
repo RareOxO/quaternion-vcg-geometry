@@ -168,6 +168,9 @@ class _Encoder(nn.Module):
         super().__init__()
         self.down = Downsample(in_channels, width, quaternion, **(stem or {}))
         self.quaternion, self.width = quaternion, width
+        # Only the recurrent encoders can be restricted; the others declare None so a
+        # caller can ask any encoder the same question.
+        self.context_steps = None
 
     def receptive_field_of(self, body_layers=()):
         return receptive_field_samples([*self.down.layer_spec, *body_layers])
@@ -236,9 +239,17 @@ class ConvEncoder(_Encoder):
     """TCN / QTCN, optionally with attention pooling instead of a mean."""
 
     def __init__(
-        self, in_channels, width, kernel=5, depth=4, dropout=0.1, quaternion=False, attention=False
+        self,
+        in_channels,
+        width,
+        kernel=5,
+        depth=4,
+        dropout=0.1,
+        quaternion=False,
+        attention=False,
+        stem=None,
     ):
-        super().__init__(in_channels, width, quaternion)
+        super().__init__(in_channels, width, quaternion, stem=stem)
         self.blocks = nn.ModuleList(
             ResidualBlock(width, kernel, dropout, quaternion) for _ in range(depth)
         )
@@ -256,8 +267,8 @@ class ConvEncoder(_Encoder):
 class TransformerEncoder(_Encoder):
     """Real Transformer: learned positions, pre-norm blocks, mean over time."""
 
-    def __init__(self, in_channels, width, depth=4, heads=4, dropout=0.1, steps=125):
-        super().__init__(in_channels, width)
+    def __init__(self, in_channels, width, depth=4, heads=4, dropout=0.1, steps=125, stem=None):
+        super().__init__(in_channels, width, stem=stem)
         self.position = nn.Parameter(torch.zeros(1, steps, width))
         nn.init.trunc_normal_(self.position, std=0.02)
         layer = nn.TransformerEncoderLayer(
@@ -286,8 +297,8 @@ class QuaternionTransformerEncoder(_Encoder):
     not a reimplementation of the paper's pipeline.
     """
 
-    def __init__(self, in_channels, width, depth=4, heads=4, dropout=0.1, steps=125):
-        super().__init__(in_channels, width, quaternion=True)
+    def __init__(self, in_channels, width, depth=4, heads=4, dropout=0.1, steps=125, stem=None):
+        super().__init__(in_channels, width, quaternion=True, stem=stem)
         self.position = nn.Parameter(torch.zeros(1, steps, width))
         nn.init.trunc_normal_(self.position, std=0.02)
         self.heads, self.depth = heads, depth
@@ -341,8 +352,8 @@ class QuaternionGraphEncoder(_Encoder):
     analogue of a GCN layer on a path graph.
     """
 
-    def __init__(self, in_channels, width, depth=4, span=4, dropout=0.1):
-        super().__init__(in_channels, width, quaternion=True)
+    def __init__(self, in_channels, width, depth=4, span=4, dropout=0.1, stem=None):
+        super().__init__(in_channels, width, quaternion=True, stem=stem)
         quaternions = width // 4
         self.span, self.depth = span, depth
         self.self_transform = nn.ModuleList(

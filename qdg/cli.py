@@ -10,6 +10,9 @@ from .experiments import (
     BENCHMARK,
     CONTEXT,
     ORDERING,
+    COMBINED,
+    HANDCRAFTED_ARMS,
+    HANDCRAFTED_PROPOSED,
     FACTORIAL,
     FACTORIAL_REFERENCE,
     REPRESENTATION_NEW,
@@ -76,6 +79,7 @@ def main():
                     "representation",
                     "context",
                     "ordering",
+                    "local-long",
                 ),
                 help="benchmark: the ten Exp 1 encoders; factorial: the Exp 2 R/L/Q "
                 "factorial plus the raw XYZ reference; representation: Exp 3 U/D/Q. "
@@ -83,6 +87,17 @@ def main():
                 "evolution. Anchors already trained are reused, never retrained.",
             )
             sub.add_argument("--seeds", nargs="+", type=int, default=[42])
+    handcrafted = subparsers.add_parser("handcrafted")
+    handcrafted.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    handcrafted.add_argument("--arm", choices=sorted(HANDCRAFTED_ARMS), required=True)
+    handcrafted.add_argument("--seed", type=int)
+    handcrafted.add_argument("--device", default="cpu")
+    handcrafted.add_argument(
+        "--checkpoint",
+        type=Path,
+        help=f"best.pt of the proposed model; required for the hybrid arm "
+        f"(normally runs/{HANDCRAFTED_PROPOSED}_seed42/best.pt)",
+    )
     evaluation = subparsers.add_parser("evaluate")
     evaluation.add_argument("--checkpoint", required=True, type=Path)
     evaluation.add_argument("--split", choices=("val", "test"), default="test")
@@ -92,6 +107,21 @@ def main():
     report.add_argument("--root", required=True, type=Path)
     args = parser.parse_args()
 
+    if args.command == "handcrafted":
+        from .classical import run_classical
+
+        config = load_config(args.config)
+        if args.seed is not None:
+            config["training"]["seed"] = args.seed
+        label, kinds = HANDCRAFTED_ARMS[args.arm]
+        hybrid = args.arm == "E5_hybrid"
+        if hybrid and not args.checkpoint:
+            parser.error("The hybrid arm needs --checkpoint of the proposed model")
+        result = run_classical(
+            config, args.arm, kinds, args.checkpoint if hybrid else None, args.device
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return
     if args.command == "evaluate":
         result = evaluate(args.checkpoint, args.split, args.device, args.limit)
     elif args.command == "tables":
@@ -133,6 +163,7 @@ def main():
                 "representation": list(REPRESENTATION_NEW),
                 "context": list(CONTEXT),
                 "ordering": list(ORDERING),
+                "local-long": [COMBINED],
             }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)

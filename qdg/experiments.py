@@ -73,6 +73,37 @@ CONTEXT_SCALE = {
 CONTEXT = tuple(f"E4_{label}" for label, _ in CONTEXT_LEVELS)
 
 
+# Experiment 5 (plan section 6): handcrafted summaries against learned dynamics.
+# A, B and C are classical arms run by qdg.classical; D is the proposed model itself,
+# reused; E concatenates D's embedding with all three handcrafted sets.
+HANDCRAFTED_ARMS = {
+    "E5_stat": ("A  statistical aggregation", ("stat",)),
+    "E5_velocity": ("B  Cruces-2016-inspired velocity summary", ("velocity",)),
+    "E5_biomarker": ("C  Cruces-2020-inspired dynamic biomarkers", ("biomarker",)),
+    "E5_hybrid": ("E  Proposed + handcrafted", ("stat", "velocity", "biomarker")),
+}
+HANDCRAFTED_NEW = tuple(HANDCRAFTED_ARMS)
+HANDCRAFTED_PROPOSED = "E2_RLQ"
+HANDCRAFTED = (
+    ("A  statistical aggregation", "E5_stat"),
+    ("B  Cruces-2016-inspired velocity summary", "E5_velocity"),
+    ("C  Cruces-2020-inspired dynamic biomarkers", "E5_biomarker"),
+    ("D  Proposed full-sequence learning", HANDCRAFTED_PROPOSED),
+    ("E  Proposed + handcrafted", "E5_hybrid"),
+)
+
+# Experiment 6 (plan section 7): local and long context together. The two scales come
+# from the Experiment 4 sweep under its pre-specified reading -- local at the end of the
+# local group, long at the point where the gain saturates -- and NOT from inspecting the
+# test set. Local-only and long-only are the corresponding Experiment 4 runs, reused.
+LOCAL_CONTEXT_MS, LONG_CONTEXT_MS = 80, 640
+COMBINED = "E6_local_long"
+LOCAL_LONG = (
+    (f"Local only ({LOCAL_CONTEXT_MS} ms)", f"E4_{LOCAL_CONTEXT_MS}ms"),
+    (f"Long only ({LONG_CONTEXT_MS} ms)", f"E4_{LONG_CONTEXT_MS}ms"),
+    ("Local + Long", COMBINED),
+)
+
 # Experiment 7: temporal ordering (plan section 8). Original is E2_RLQ, reused. Block
 # shuffles keep local dynamics and break longer-range organisation; the point-wise
 # shuffle breaks both. Each is run twice: permuting the Q branch alone, and permuting
@@ -206,6 +237,23 @@ EXPERIMENTS = {
             "context_ms": context,
         }
         for label, context in CONTEXT_LEVELS
+    },
+    # Experiment 6: both scales at once. Two encoders per branch, one restricted to the
+    # local context and one to the long context, concatenated. The width is solved so the
+    # total parameter count matches the single-scale runs it is compared against.
+    COMBINED: {
+        "variant": "RLAB",
+        "encoder": SELECTED_ENCODER,
+        "angular_algebra": "standard",
+        "angular_blocks": ["rotation"],
+        "angular_quaternions": 22,
+        "branch_width": 32,
+        "branches": ["radial", "linear", "angular"],
+        "stem": CONTEXT_STEM,
+        "context_ms": [LOCAL_CONTEXT_MS, LONG_CONTEXT_MS],
+        # Two encoders per branch, so the width is solved to land within 1.1% of the
+        # single-scale runs rather than 7% above them.
+        "width_override": 31,
     },
     # Experiment 7: temporal ordering. Identical to E2_RLQ except that the feature
     # sequence is permuted before the encoder.
@@ -626,6 +674,8 @@ def tables(root):
     representation_ablation_tables(root, summary)
     context_tables(root, summary)
     ordering_tables(root, summary)
+    handcrafted_tables(root, summary)
+    local_long_tables(root, summary)
     return summary
 
 
@@ -1595,13 +1645,20 @@ def interpret_context(scores):
     band = NOISE_BAND
     ordered = sorted(levels)
     best = max(ordered, key=lambda c: scores[c])
-    total = scores[ordered[-1]] - scores[ordered[0]]
     grouped = {}
     for context in ordered:
         grouped.setdefault(CONTEXT_SCALE[context], []).append(scores[context])
     means = {scale: sum(values) / len(values) for scale, values in grouped.items()}
     summary = ", ".join(f"{scale} {value:.4f}" for scale, value in means.items())
-    lines = [f"Scale means: {summary}."]
+    # The trend is read between the plan's scale GROUPS, so the number quoted has to be
+    # the difference of their means -- not of the single shortest and longest levels,
+    # which is a different and larger quantity.
+    total = means["cycle-scale"] - means["local"]
+    extremes = scores[ordered[-1]] - scores[ordered[0]]
+    lines = [
+        f"Scale means: {summary}.",
+        f"Cycle-scale minus local: {total:+.4f}. Longest minus shortest level: {extremes:+.4f}.",
+    ]
     if total > band:
         lines.append(
             f"**Longer accessible context helps.** Cycle-scale minus local is "
@@ -1752,3 +1809,182 @@ def interpret_ordering(summary):
             verdict = "The ordering is not monotone; seed 42 alone supports no claim."
         lines.append(f"**{SCOPE_LABELS[scope]}.** {verdict}")
     return "\n\n".join(lines)
+
+
+def handcrafted_tables(root, summary):
+    """Experiment 5: handcrafted summaries against learned dynamics (plan section 6)."""
+    root = Path(root)
+    if not any(name in summary for _, name in HANDCRAFTED):
+        return None
+    rows = []
+    for label, name in HANDCRAFTED:
+        if name not in summary:
+            continue
+        settings = summary[name].get("settings") or {}
+        rows.append(
+            [
+                label,
+                settings.get("selected_classifier", f"E* ({BENCHMARK_LABELS[SELECTED_ENCODER]})"),
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                _cell(summary[name], "macro_auprc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+        )
+    main = _table(["Arm", "Classifier", "Params", "Macro AUROC", "Macro AUPRC", *CLASSES], rows)
+    diffs = ""
+    proposed = HANDCRAFTED_PROPOSED
+    if proposed in summary:
+        comparisons = [
+            (f"D - {label.split()[0]}", proposed, name)
+            for label, name in HANDCRAFTED
+            if name in summary and name not in (proposed, "E5_hybrid")
+        ]
+        if "E5_hybrid" in summary:
+            comparisons.append(("E - D", "E5_hybrid", proposed))
+        diffs = _table(
+            ["Comparison", "Delta Macro AUROC"],
+            [
+                [
+                    label,
+                    f"{summary[new]['macro_auroc_mean'] - summary[old]['macro_auroc_mean']:+.4f}",
+                ]
+                for label, new, old in comparisons
+            ],
+        )
+    text = (
+        "# Experiment 5: handcrafted summaries vs learned temporal dynamics\n\n"
+        "A, B and C compress the same R/L/Q signals into fixed summaries and hand them to\n"
+        "a conventional classifier; D is the proposed model, reused; E concatenates D's\n"
+        "pre-classifier embedding with all three handcrafted sets and uses the same\n"
+        "classifier procedure as A/B/C.\n\n"
+        "B and C are reimplementations on PTB-XL, not replications: the task, the dataset\n"
+        "and the available annotation differ from the original papers, and every\n"
+        "definition used is stated in qdg/handcrafted.py.\n\n"
+        "Classifier: Logistic Regression and a small MLP are both fitted for every arm and\n"
+        "the one with the better VALIDATION Macro AUROC is reported, so no arm gets a\n"
+        "classifier the others could not have had. Standardisation is fitted on the\n"
+        "training folds only; the features themselves are a deterministic function of a\n"
+        "single record and cannot leak across the split.\n\n"
+        f"Seed 42, screening band {NOISE_BAND:.4f}.\n\n"
+        "## Table E5.1: Arms\n\n"
+        + main
+        + "\n\n"
+        + ("## Table E5.2: Against the proposed model\n\n" + diffs + "\n\n" if diffs else "")
+        + "## Verdict\n\n"
+        + interpret_handcrafted(summary)
+        + "\n"
+    )
+    missing = [name for _, name in HANDCRAFTED if name not in summary]
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "handcrafted_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_handcrafted(summary):
+    """Plan section 6.5, stated in advance: the reading depends on where E lands."""
+    proposed, hybrid = HANDCRAFTED_PROPOSED, "E5_hybrid"
+    arms = [name for _, name in HANDCRAFTED if name not in (proposed, hybrid)]
+    if proposed not in summary or any(name not in summary for name in arms):
+        return "**Incomplete.** Train every handcrafted arm and the proposed model first."
+    band = NOISE_BAND
+    best_handcrafted = max(arms, key=lambda name: summary[name]["macro_auroc_mean"])
+    gap = summary[proposed]["macro_auroc_mean"] - summary[best_handcrafted]["macro_auroc_mean"]
+    lines = [
+        f"Best handcrafted arm: {best_handcrafted} at "
+        f"{summary[best_handcrafted]['macro_auroc_mean']:.4f}; proposed "
+        f"{summary[proposed]['macro_auroc_mean']:.4f}, a gap of {gap:+.4f}."
+    ]
+    if hybrid not in summary:
+        lines.append("The hybrid arm is not trained, so no conclusion about complementarity.")
+        return "\n\n".join(lines)
+    addition = summary[hybrid]["macro_auroc_mean"] - summary[proposed]["macro_auroc_mean"]
+    if gap > band and abs(addition) <= band:
+        lines.append(
+            f"**Learned dynamics win and the summaries add nothing on top.** E - D is "
+            f"{addition:+.4f}, inside the band, so the predefined summaries carry little "
+            "beyond what the learned sequence representation already holds."
+        )
+    elif addition > band:
+        lines.append(
+            f"**Complementary.** E - D is {addition:+.4f}, clear of the band: the "
+            "clinically motivated features and the learned representation hold different "
+            "information."
+        )
+    elif gap <= band:
+        lines.append(
+            f"**Not separated.** The proposed model leads the best handcrafted arm by "
+            f"{gap:+.4f}, inside the band, so at seed 42 learning the full sequence is not "
+            "distinguishable from compressing it first."
+        )
+    else:
+        lines.append(f"**E is below D** by {addition:+.4f}; adding the summaries hurts.")
+    return "\n\n".join(lines)
+
+
+def local_long_tables(root, summary):
+    """Experiment 6: local and long context together (plan section 7)."""
+    root = Path(root)
+    if COMBINED not in summary:
+        return None
+    present = [(label, name) for label, name in LOCAL_LONG if name in summary]
+    main = _table(
+        ["Condition", "Params", "Macro AUROC", "Macro AUPRC", *CLASSES],
+        [
+            [
+                label,
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                _cell(summary[name], "macro_auprc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+            for label, name in present
+        ],
+    )
+    text = (
+        "# Experiment 6: local and long-context information\n\n"
+        f"Local is {LOCAL_CONTEXT_MS} ms and long is {LONG_CONTEXT_MS} ms. Both come from the\n"
+        "Experiment 4 sweep under its pre-specified reading -- local at the end of the\n"
+        "local group, long at the point where the gain saturates -- and not from\n"
+        "inspecting the test set. The two single-scale conditions ARE the corresponding\n"
+        "Experiment 4 runs, reused. Local + Long runs one encoder per scale on every\n"
+        "branch and concatenates them; its width is solved so the parameter count lands\n"
+        "within about 1% of the single-scale runs.\n\n"
+        "This experiment gates a claim: only if Local + Long beats both single scales may\n"
+        "the manuscript say the method integrates local and long-range dynamics.\n"
+        "Otherwise the narrower 'long-context temporal modeling' is what is supported.\n\n"
+        f"Seed 42, screening band {NOISE_BAND:.4f}.\n\n"
+        "## Table E6.1: Local, long and both\n\n" + main + "\n\n"
+        "## Verdict\n\n" + interpret_local_long(summary) + "\n"
+    )
+    missing = [name for _, name in LOCAL_LONG if name not in summary]
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "local_long_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_local_long(summary):
+    """The claim this gates is stated in advance (plan section 7)."""
+    names = [name for _, name in LOCAL_LONG]
+    if any(name not in summary for name in names):
+        return "**Incomplete.** Train all three conditions before reading a verdict."
+    local, long_, both = (summary[name]["macro_auroc_mean"] for name in names)
+    band = NOISE_BAND
+    best_single = max(local, long_)
+    gain = both - best_single
+    if gain > band:
+        return (
+            f"**Integration supported.** Local + Long is {gain:+.4f} above the better "
+            f"single scale ({max(('local', local), ('long', long_), key=lambda p: p[1])[0]}), "
+            f"clear of the {band:.3f} band. The manuscript may claim the method integrates "
+            "local and long-range dynamics."
+        )
+    return (
+        f"**Integration not supported.** Local + Long is {gain:+.4f} against the better "
+        f"single scale, inside the {band:.3f} band. Use the narrower claim, "
+        "'long-context temporal modeling', not 'integrates local and long-range dynamics'."
+    )

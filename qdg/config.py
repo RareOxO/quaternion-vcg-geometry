@@ -60,7 +60,14 @@ def validate_config(config):
         "quaternion",
     ):
         raise ValueError("model.angular_algebra must be standard or quaternion")
-    for key in ("real_width", "raw_width", "fusion_dim", "branch_width", "angular_quaternions"):
+    for key in (
+        "real_width",
+        "raw_width",
+        "fusion_dim",
+        "branch_width",
+        "angular_quaternions",
+        "width_override",
+    ):
         if model.get(key) is not None and (not isinstance(model[key], int) or model[key] < 1):
             raise ValueError(f"model.{key} must be a positive integer when set")
     if model["kernel"] % 2 == 0:

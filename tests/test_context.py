@@ -57,10 +57,12 @@ def test_context_maps_to_whole_stem_steps(full_config):
     """20 ms per step, so every level is a whole number of resets."""
     for label, context in CONTEXT_LEVELS:
         model = _model(full_config, f"E4_{label}")
-        steps = {branch: encoder.context_steps for branch, encoder in model.encoders.items()}
+        # context_steps is a list because Experiment 6 runs two scales at once; here
+        # every level is a single scale, so each branch carries exactly one.
+        steps = {branch: tuple(encoder.context_steps) for branch, encoder in model.encoders.items()}
         # Every branch carries the same restriction, so they stay temporally aligned.
         assert len(set(steps.values())) == 1, steps
-        assert steps["angular"] == (None if context is None else context // CONTEXT_STEP_MS)
+        assert steps["angular"] == ((None,) if context is None else (context // CONTEXT_STEP_MS,))
         assert model.settings["context_ms"] == context
 
 
@@ -123,7 +125,7 @@ def test_restriction_is_off_outside_experiment_4(full_config):
         assert model.settings["context_ms"] is None
         assert model.settings["stem"] is None
         for encoder in model.encoders.values():
-            assert getattr(encoder, "context_steps", None) is None
+            assert encoder.context_steps == [None]
 
 
 @pytest.mark.parametrize("name", CONTEXT)
@@ -145,9 +147,13 @@ def test_scale_grouping_is_pre_specified():
 
 
 def test_context_verdicts():
-    rising = {c: 0.90 + 0.001 * i for i, c in enumerate([20, 40, 80, 160, 320, 640, 1280])}
-    rising[None] = 0.906
-    assert "Longer accessible context helps" in interpret_context(rising)
+    # The trend is read between SCALE GROUP means, not between the extreme levels, so a
+    # rising case has to clear the band on the group difference.
+    rising = {c: 0.90 + 0.003 * i for i, c in enumerate([20, 40, 80, 160, 320, 640, 1280])}
+    rising[None] = 0.918
+    verdict = interpret_context(rising)
+    assert "Longer accessible context helps" in verdict
+    assert "Cycle-scale minus local: +0.0135" in verdict
     flat = {c: 0.90 for c in [20, 40, 80, 160, 320, 640, 1280, None]}
     assert "Not supported" in interpret_context(flat)
     assert "Incomplete" in interpret_context({20: 0.9})

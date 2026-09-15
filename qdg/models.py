@@ -239,6 +239,30 @@ def build_model(config, stats):
 SHUFFLE_SCOPES = ("angular", "all")
 
 
+class MultiContextEncoder(nn.Module):
+    """One or more encoders over the same input, concatenated.
+
+    With a single member this is a transparent wrapper, so every experiment other than
+    Experiment 6 behaves exactly as before. With two, it is the local-plus-long model:
+    the same sequence read at two accessible-context limits, joined at the branch output
+    rather than inside the recurrence, which keeps each path's restriction intact.
+    """
+
+    def __init__(self, members):
+        super().__init__()
+        self.members = nn.ModuleList(members)
+        self.width = sum(member.width for member in self.members)
+        fields = [member.receptive_field for member in self.members]
+        self.receptive_field = None if None in fields else max(fields)
+        self.quaternion = any(member.quaternion for member in self.members)
+        self.context_steps = [member.context_steps for member in self.members]
+
+    def forward(self, x):
+        if len(self.members) == 1:
+            return self.members[0](x)
+        return torch.cat([member(x) for member in self.members], dim=-1)
+
+
 class TemporalShuffle(nn.Module):
     """Permute the time axis of a feature sequence (Experiment 7).
 
@@ -373,6 +397,13 @@ class BranchedRLANet(nn.Module):
         encoder = config.get("encoder")
         if encoder:
             angular_width, branch_width = encoder_widths(encoder, 4 * quaternions)
+            # `width_override` exists for Experiment 6 only. Its model runs two encoders
+            # per branch, so matching the single-scale runs it is compared against needs
+            # a width the 2 * quaternions grid cannot express. Leaving it unset keeps
+            # every other experiment on exactly the width it was trained with.
+            override = config.get("width_override")
+            if override:
+                angular_width = branch_width = override
             body = {k: v for k, v in shared.items() if k != "stem_stride"}
             # Experiment 4 restricts how much time the recurrence may integrate. The
             # limit is expressed in milliseconds and converted here, because the number
@@ -384,22 +415,34 @@ class BranchedRLANet(nn.Module):
             )
             step_ms = 1000 * factor / stats["sampling_rate"]
             context_ms = config.get("context_ms")
-            context_steps = None
-            if context_ms is not None:
-                if context_ms % step_ms:
+            # A list asks for one encoder per context, run in parallel and concatenated:
+            # that is Experiment 6's local-plus-long model.
+            wanted = context_ms if isinstance(context_ms, list) else [context_ms]
+            context_steps = []
+            for value in wanted:
+                if value is None:
+                    context_steps.append(None)
+                    continue
+                if value % step_ms:
                     raise ValueError(
-                        f"context_ms {context_ms} is not a whole number of "
-                        f"{step_ms:g} ms stem steps"
+                        f"context_ms {value} is not a whole number of {step_ms:g} ms stem steps"
                     )
-                context_steps = int(context_ms / step_ms)
-            body.update(stem=stem, context_steps=context_steps)
+                context_steps.append(int(value / step_ms))
+            body.update(stem=stem)
+            self.context_steps = context_steps
             self.encoders = nn.ModuleDict(
                 {
-                    branch: build_encoder(
-                        branch_encoder(encoder, branch),
-                        self.frontends[branch].out_channels,
-                        angular_width if branch == "angular" else branch_width,
-                        **body,
+                    branch: MultiContextEncoder(
+                        [
+                            build_encoder(
+                                branch_encoder(encoder, branch),
+                                self.frontends[branch].out_channels,
+                                angular_width if branch == "angular" else branch_width,
+                                context_steps=steps,
+                                **body,
+                            )
+                            for steps in context_steps
+                        ]
                     )
                     for branch in branches
                 }
