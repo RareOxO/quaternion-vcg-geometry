@@ -226,3 +226,64 @@ def test_earlier_variants_are_untouched(full_config, ecg):
     # M1's full-angle descriptor must not have been replaced by the rotation quaternion.
     m1 = _model(full_config, "M1").frontend(ecg)
     assert (m1.square().sum(1) - 1).abs().max() < 1e-4
+
+
+# --- Angular representation 指导书 §5: baseline vs new, everything but the four numbers ---
+
+
+def test_baseline_and_new_angular_tensors_are_structurally_identical(full_config, ecg):
+    """Shape, dtype, padding and effective time positions must match exactly (§5)."""
+    baseline = _model(full_config, "RLA_standard").frontends["angular"](ecg)
+    new = _model(full_config, "A0").frontends["angular"](ecg)
+    assert baseline.shape == new.shape == (2, 4, 5000)
+    assert baseline.dtype == new.dtype == torch.float32
+    assert torch.isfinite(baseline).all() and torch.isfinite(new).all()
+    # Both place the relation for t -> t+lag at t and replicate the final lag positions,
+    # so the same trailing samples are padded in both.
+    lag = 10
+    assert (baseline[..., -lag:] == baseline[..., -lag - 1 : -lag]).all()
+    assert (new[..., -lag:] == new[..., -lag - 1 : -lag]).all()
+    # Same numbers of distinct time steps carry real content.
+    assert baseline[..., :-lag].shape == new[..., :-lag].shape
+
+
+def test_baseline_and_new_are_the_same_angle_at_half_and_full(full_config, ecg):
+    """The two encode one angle: the new scalar is cos(t/2) where the old is cos(t)."""
+    baseline = _model(full_config, "RLA_standard").frontends["angular"](ecg)
+    new = _model(full_config, "A0").frontends["angular"](ecg)
+    full_angle = baseline[:, 0].clamp(-1, 1).arccos()
+    half_angle = new[:, 0].clamp(-1, 1).arccos() * 2
+    torch.testing.assert_close(half_angle, full_angle, atol=1e-3, rtol=1e-3)
+    # Both are unit norm, so neither carries magnitude.
+    assert (baseline.square().sum(1) - 1).abs().max() < 1e-4
+    assert (new.square().sum(1) - 1).abs().max() < 1e-4
+    # And they are genuinely different tensors.
+    assert not torch.allclose(baseline, new, atol=1e-2)
+
+
+def test_baseline_and_new_encoders_are_identical(full_config):
+    """§4: only the representation moves; the angular encoder must be untouched."""
+    baseline, new = _model(full_config, "RLA_standard"), _model(full_config, "A0")
+    assert baseline.angular_parameters() == new.angular_parameters()
+    assert sum(p.numel() for p in baseline.parameters()) == sum(p.numel() for p in new.parameters())
+    assert (
+        baseline.encoders["angular"].receptive_field
+        == new.encoders["angular"].receptive_field
+        == 640
+    )
+    for block in ("radial", "linear"):
+        assert baseline.encoders[block].width == new.encoders[block].width
+    assert baseline.settings["branch_width"] == new.settings["branch_width"]
+    assert baseline.settings["fusion_dim"] == new.settings["fusion_dim"]
+    assert baseline.settings["scales_ms"] == new.settings["scales_ms"] == [20]
+
+
+def test_representation_verdict_rule():
+    from qdg.experiments import BASELINE_MACRO_AUROC, interpret_representation
+
+    assert BASELINE_MACRO_AUROC == 0.9130
+    assert "Clear positive signal" in interpret_representation(0.01)
+    assert "Negative signal" in interpret_representation(-0.01)
+    weak = interpret_representation(0.0040)
+    assert "Weak / indistinguishable" in weak
+    assert "must NOT be written up as a quaternion advantage" in weak

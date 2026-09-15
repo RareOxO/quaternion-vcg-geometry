@@ -110,6 +110,17 @@ TEMPORAL_DIFFS = (
 ANGULAR = (("RLA-Standard", "RLA_standard"), ("RLA-Quaternion", "RLA_quaternion"))
 ANGULAR_NEW = ("RLA_standard", "RLA_quaternion")
 
+# Angular representation 指导书 §2. Both runs already exist: the baseline is the
+# full-angle control of the operator round, and the new variant is the registry's A0,
+# whose angular branch is the 4-channel half-angle rotation quaternion. Nothing is
+# retrained -- this round only formalises the comparison (§1, §9).
+REPRESENTATION = (
+    ("Baseline: full-angle [dot, cross]", "RLA_standard", "[cos t, n sin t]"),
+    ("New: half-angle rotation quaternion", "A0", "[cos(t/2), n sin(t/2)]"),
+)
+# The recorded matched seed-42 baseline, used only when its run directory is absent.
+BASELINE_MACRO_AUROC = 0.9130
+
 # Temporal evolution 方案 §3. A1 vs A2 is the question; A0 is the local-only floor.
 EVOLUTION = (
     ("A0 Local only", "A0", "q_t"),
@@ -387,6 +398,7 @@ def tables(root):
     temporal_tables(root, summary, encoder_stats(root))
     angular_tables(root, summary, angular_stats(root))
     evolution_tables(root, summary, angular_stats(root))
+    representation_tables(root, summary, angular_stats(root))
     return summary
 
 
@@ -941,3 +953,109 @@ def interpret_evolution(gap):
                 "42 even plain angular evolution is not distinguishable from local state."
             )
     return verdict
+
+
+def representation_tables(root, summary, angular=None):
+    """Tables of the Angular representation 指导书 §8, written to representation_tables.md.
+
+    Neither model is trained here: the baseline is the operator round's full-angle
+    control and the new variant is the registry's A0. The two differ only in the four
+    angular channels, and their parameter counts are identical, so the comparison is
+    already matched (§4).
+    """
+    root = Path(root)
+    baseline_name, new_name = REPRESENTATION[0][1], REPRESENTATION[1][1]
+    if new_name not in summary:
+        return None
+    angular = angular or {}
+    rows = []
+    for label, name, formula in REPRESENTATION:
+        if name not in summary:
+            rows.append([label, formula, "reused, run not present", "--", "--", *["--"] * 5])
+            continue
+        rows.append(
+            [
+                label,
+                formula,
+                f"{summary[name]['parameters']:,}",
+                f"{angular.get(name, {}).get('angular_parameters', 0):,}"
+                if angular.get(name, {}).get("angular_parameters")
+                else "?",
+                _cell(summary[name], "macro_auroc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+        )
+    main = _table(
+        [
+            "Variant",
+            "Angular representation",
+            "Total Params",
+            "Angular Params",
+            "Macro AUROC",
+            *CLASSES,
+        ],
+        rows,
+    )
+    if baseline_name in summary:
+        baseline = summary[baseline_name]["macro_auroc_mean"]
+        source = "both runs present"
+    else:
+        baseline = BASELINE_MACRO_AUROC
+        source = f"baseline run absent; using the recorded {BASELINE_MACRO_AUROC:.4f}"
+    gap = summary[new_name]["macro_auroc_mean"] - baseline
+    per_class = ""
+    if baseline_name in summary:
+        per_class = _table(
+            ["Class", "New - Baseline"],
+            [
+                [
+                    cls,
+                    f"{summary[new_name][f'{cls}_mean'] - summary[baseline_name][f'{cls}_mean']:+.4f}",
+                ]
+                for cls in CLASSES
+            ],
+        )
+    text = (
+        "# Angular representation: full-angle descriptor vs rotation quaternion\n\n"
+        "Same 1280 ms long-context temporal modelling, same R and L branches, same\n"
+        "fusion, LayerNorm and head, same 4 angular channels, same angular encoder and\n"
+        "parameter count, delta fixed at 20 ms. The only variable is whether the four\n"
+        "angular numbers are the full-angle descriptor [cos t, n sin t] -- which is NOT a\n"
+        "physical rotation quaternion -- or the standard half-angle rotation quaternion\n"
+        f"[cos(t/2), n sin(t/2)]. Seed 42 only, screening band {NOISE_BAND:.4f}.\n\n"
+        "## Table 18: Angular representation results\n\n"
+        + main
+        + "\n\n"
+        + ("## Table 19: Per-class New - Baseline\n\n" + per_class + "\n\n" if per_class else "")
+        + f"## Verdict\n\nDelta Macro AUROC = {gap:+.4f} ({source}).\n\n"
+        + interpret_representation(gap)
+        + "\n"
+    )
+    (root / "representation_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_representation(gap):
+    """The §6 decision rule: a single screening call on one number."""
+    band = NOISE_BAND
+    if gap > band:
+        return (
+            f"**Clear positive signal.** {gap:+.4f} exceeds +{band:.3f}, so replacing the "
+            "full-angle descriptor with a standard rotation quaternion is worth "
+            "confirming.\n\nNext: run seeds 43/44 for both variants."
+        )
+    if gap < -band:
+        return (
+            f"**Negative signal.** {gap:+.4f} is below -{band:.3f}.\n\n"
+            "Next: stop the quaternion representation line."
+        )
+    return (
+        f"**Weak / indistinguishable signal.** {gap:+.4f} lies inside the "
+        f"+-{band:.3f} screening band, so this must be recorded as indistinguishable "
+        "and must NOT be written up as a quaternion advantage.\n\n"
+        "Next: do not extend the architecture. Because the control is unusually clean "
+        "-- identical parameter counts, identical everything but the four angular "
+        "channels -- a low-cost seeds 43/44 confirmation is a defensible option, but "
+        "that is a separate decision, not an automatic follow-on."
+    )
