@@ -121,6 +121,10 @@ def run_classical(config, name, kinds, checkpoint=None, device="cpu"):
     }
     manifest = load_manifest(config["data"])
     matrix = feature_columns(config, kinds) if kinds else None
+    frozen = 0
+    if checkpoint is not None:
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        frozen = sum(value.numel() for value in state["model"].values())
     parts = {}
     for split, dataset in splits.items():
         pieces = []
@@ -158,7 +162,13 @@ def run_classical(config, name, kinds, checkpoint=None, device="cpu"):
             "selected_classifier": best,
             "embedding_checkpoint": str(checkpoint) if checkpoint else None,
         },
-        "parameters": int(sum(values.size for values in _coefficients(model))),
+        # The classifier's own coefficients, and separately anything frozen upstream of
+        # it. Reporting only the former would put 915 next to the proposed model's
+        # 62,617 and read as though a far smaller model had matched it, when the hybrid
+        # arm runs that same model first and then fits a head on top.
+        "classifier_parameters": int(sum(values.size for values in _coefficients(model))),
+        "frozen_parameters": int(frozen),
+        "parameters": int(sum(values.size for values in _coefficients(model)) + frozen),
         "sampling_rate": manifest["stats"]["sampling_rate"],
         "input_channels": int(parts["train"].shape[1]),
         "receptive_field_samples": None,
@@ -176,6 +186,8 @@ def run_classical(config, name, kinds, checkpoint=None, device="cpu"):
         "validation_macro_auroc": validation["macro_auroc"],
         "validation_macro_auprc": validation["macro_auprc"],
         "parameters": environment["parameters"],
+        "classifier_parameters": environment["classifier_parameters"],
+        "frozen_parameters": environment["frozen_parameters"],
         "settings": environment["settings"],
         "limited_evaluation": False,
         "smoke_training": False,

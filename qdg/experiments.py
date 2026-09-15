@@ -542,6 +542,9 @@ def aggregate(results):
     """Mean and std over seeds of macro and per-class AUROC at fixed thresholds."""
     row = {"n_seeds": len(results), "seeds": sorted(r["seed"] for r in results)}
     row["parameters"] = results[0]["parameters"]
+    for key in ("classifier_parameters", "frozen_parameters"):
+        if key in results[0]:
+            row[key] = results[0][key]
     values = {"macro_auroc": [], "macro_auprc": []}
     for name in CLASSES:
         values[name] = []
@@ -1811,6 +1814,17 @@ def interpret_ordering(summary):
     return "\n\n".join(lines)
 
 
+def _parameter_cell(row):
+    """Fitted parameters, plus whatever is frozen upstream, kept apart."""
+    frozen = row.get("frozen_parameters")
+    fitted = row.get("classifier_parameters")
+    if fitted is None:
+        return f"{row['parameters']:,}"
+    if not frozen:
+        return f"{fitted:,}"
+    return f"{fitted:,} + {frozen:,}"
+
+
 def handcrafted_tables(root, summary):
     """Experiment 5: handcrafted summaries against learned dynamics (plan section 6)."""
     root = Path(root)
@@ -1825,13 +1839,16 @@ def handcrafted_tables(root, summary):
             [
                 label,
                 settings.get("selected_classifier", f"E* ({BENCHMARK_LABELS[SELECTED_ENCODER]})"),
-                f"{summary[name]['parameters']:,}",
+                _parameter_cell(summary[name]),
                 _cell(summary[name], "macro_auroc"),
                 _cell(summary[name], "macro_auprc"),
                 *[_cell(summary[name], cls) for cls in CLASSES],
             ]
         )
-    main = _table(["Arm", "Classifier", "Params", "Macro AUROC", "Macro AUPRC", *CLASSES], rows)
+    main = _table(
+        ["Arm", "Classifier", "Params (fitted + frozen)", "Macro AUROC", "Macro AUPRC", *CLASSES],
+        rows,
+    )
     diffs = ""
     proposed = HANDCRAFTED_PROPOSED
     if proposed in summary:
@@ -1861,6 +1878,9 @@ def handcrafted_tables(root, summary):
         "B and C are reimplementations on PTB-XL, not replications: the task, the dataset\n"
         "and the available annotation differ from the original papers, and every\n"
         "definition used is stated in qdg/handcrafted.py.\n\n"
+        "Params are split because the arms are not commensurable: A, B and C fit only a\n"
+        "classifier on fixed features, while D fits a whole sequence model and E fits a\n"
+        "classifier on top of D frozen. The second number is what is frozen upstream.\n\n"
         "Classifier: Logistic Regression and a small MLP are both fitted for every arm and\n"
         "the one with the better VALIDATION Macro AUROC is reported, so no arm gets a\n"
         "classifier the others could not have had. Standardisation is fitted on the\n"
