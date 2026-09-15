@@ -32,7 +32,7 @@ from torch import nn
 
 from .data import CLASSES
 from .encoders import Downsample, branch_encoder, build_encoder, encoder_widths
-from .geometry import VCGGeometry
+from .geometry import VCGGeometry, lag_samples
 from .quaternion_nn import TCNEncoder
 
 # Representation diagnostic of the v2 指导书 §3. All Real, single 20 ms scale.
@@ -236,6 +236,55 @@ def build_model(config, stats):
     return GeometryNet(config, stats)
 
 
+SHUFFLE_SCOPES = ("angular", "all")
+
+
+class TemporalShuffle(nn.Module):
+    """Permute the time axis of a feature sequence (Experiment 7).
+
+    Applied to the frontend OUTPUT, never to the raw signal: R, L and Q are built from
+    the intact recording first, so what the permutation destroys is the order of the
+    dynamic states, not the states themselves. Shuffling the signal instead would
+    corrupt the lagged quantities as they are computed and would test something else.
+
+    `block` is a number of samples. Whole blocks are permuted and the order inside each
+    is kept, so a block shuffle preserves local dynamics and breaks longer-range
+    organisation; `block=1` is the point-wise shuffle that breaks both. When the length
+    is not a whole number of blocks the remainder stays at the end -- at 160 ms that is
+    40 of 5000 samples, and it is the same tail in every condition.
+
+    A permutation is drawn fresh for every record so the model cannot learn to invert a
+    fixed one. In eval the generator is re-seeded at each call, which makes the reported
+    metric reproducible while still giving each record its own permutation.
+    """
+
+    def __init__(self, block=1, seed=0):
+        super().__init__()
+        if block < 1:
+            raise ValueError("Shuffle block must be at least one sample")
+        self.block, self.seed = block, seed
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def permutation(self, batch, steps, device):
+        if self.block > steps:
+            raise ValueError("Shuffle block is longer than the sequence")
+        if not self.training:
+            self.generator.manual_seed(self.seed)
+        count = steps // self.block
+        order = torch.stack([torch.randperm(count, generator=self.generator) for _ in range(batch)])
+        index = (order[:, :, None] * self.block + torch.arange(self.block)).reshape(batch, -1)
+        if index.shape[1] < steps:
+            tail = torch.arange(index.shape[1], steps).expand(batch, -1)
+            index = torch.cat((index, tail), dim=1)
+        return index.to(device)
+
+    def forward(self, x, index=None):
+        """(B, C, T) -> (B, C, T), permuted along time by `index` or a fresh draw."""
+        if index is None:
+            index = self.permutation(x.shape[0], x.shape[-1], x.device)
+        return x.gather(-1, index.unsqueeze(1).expand_as(x))
+
+
 BRANCH_BLOCKS = ("radial", "linear", "angular")
 # Experiment 2 runs the 2^3-1 factorial over these, plus a raw XYZ reference that is a
 # single branch carrying the unnormalized cardiac vector.
@@ -373,9 +422,28 @@ class BranchedRLANet(nn.Module):
         )
         self.norm = nn.LayerNorm(len(branches) * dim)
         self.head = nn.Linear(len(branches) * dim, len(CLASSES))
+        # Experiment 7. `scope` says which branches are permuted; "all" uses ONE
+        # permutation for every branch, because per-branch draws would additionally
+        # destroy cross-component alignment and confound the comparison.
+        shuffle = config.get("shuffle")
+        self.shuffle_scope = (shuffle or {}).get("scope", "angular")
+        if shuffle and self.shuffle_scope not in SHUFFLE_SCOPES:
+            raise ValueError(f"shuffle.scope must be one of {SHUFFLE_SCOPES}")
+        self.shuffle = (
+            TemporalShuffle(
+                block=lag_samples(shuffle["block_ms"], stats["sampling_rate"])
+                if shuffle.get("block_ms")
+                else 1,
+                seed=config.get("shuffle_seed", 0),
+            )
+            if shuffle
+            else None
+        )
         self.settings = {
             "branches": list(branches),
             "encoder": encoder,
+            "shuffle": dict(shuffle) if shuffle else None,
+            "shuffle_block_samples": self.shuffle.block if self.shuffle else None,
             "context_ms": config.get("context_ms"),
             "stem": config.get("stem"),
             "branch_encoders": {b: branch_encoder(encoder, b) for b in branches}
@@ -419,8 +487,19 @@ class BranchedRLANet(nn.Module):
         }
 
     def forward_features(self, ecg):
+        features = {branch: self.frontends[branch](ecg) for branch in self.branches}
+        if self.shuffle is not None:
+            targets = self.branches if self.shuffle_scope == "all" else ("angular",)
+            any_feature = next(iter(features.values()))
+            # One draw shared by every permuted branch keeps them aligned with each other.
+            index = self.shuffle.permutation(
+                any_feature.shape[0], any_feature.shape[-1], any_feature.device
+            )
+            for branch in targets:
+                if branch in features:
+                    features[branch] = self.shuffle(features[branch], index)
         parts = [
-            self.projections[branch](self.encoders[branch](self.frontends[branch](ecg)).float())
+            self.projections[branch](self.encoders[branch](features[branch]).float())
             for branch in self.branches
         ]
         return self.norm(torch.cat(parts, dim=-1))

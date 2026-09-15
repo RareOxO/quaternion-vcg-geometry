@@ -9,6 +9,7 @@ from .experiments import (
     ANGULAR_NEW,
     BENCHMARK,
     CONTEXT,
+    ORDERING,
     FACTORIAL,
     FACTORIAL_REFERENCE,
     REPRESENTATION_NEW,
@@ -74,6 +75,7 @@ def main():
                     "factorial",
                     "representation",
                     "context",
+                    "ordering",
                 ),
                 help="benchmark: the ten Exp 1 encoders; factorial: the Exp 2 R/L/Q "
                 "factorial plus the raw XYZ reference; representation: Exp 3 U/D/Q. "
@@ -130,6 +132,7 @@ def main():
                 "factorial": [*FACTORIAL, FACTORIAL_REFERENCE],
                 "representation": list(REPRESENTATION_NEW),
                 "context": list(CONTEXT),
+                "ordering": list(ORDERING),
             }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)

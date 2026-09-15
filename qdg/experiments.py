@@ -73,6 +73,24 @@ CONTEXT_SCALE = {
 CONTEXT = tuple(f"E4_{label}" for label, _ in CONTEXT_LEVELS)
 
 
+# Experiment 7: temporal ordering (plan section 8). Original is E2_RLQ, reused. Block
+# shuffles keep local dynamics and break longer-range organisation; the point-wise
+# shuffle breaks both. Each is run twice: permuting the Q branch alone, and permuting
+# all three with ONE shared permutation so cross-component alignment survives.
+SHUFFLE_LEVELS = (("block40", 40), ("block80", 80), ("block160", 160), ("full", None))
+SHUFFLE_SCOPES = (("q", "angular"), ("joint", "all"))
+ORDERING = tuple(
+    f"E7_{scope}_{label}" for scope, _ in SHUFFLE_SCOPES for label, _ in SHUFFLE_LEVELS
+)
+ORDERING_ORIGINAL = "E2_RLQ"
+SHUFFLE_LABELS = {
+    "block40": "Block shuffle 40 ms",
+    "block80": "Block shuffle 80 ms",
+    "block160": "Block shuffle 160 ms",
+    "full": "Point-wise shuffle",
+}
+SCOPE_LABELS = {"q": "Q only", "joint": "Joint R/L/Q"}
+
 # name -> model-config overrides applied on top of the base YAML.
 EXPERIMENTS = {
     "M0": {"variant": "M0"},
@@ -188,6 +206,22 @@ EXPERIMENTS = {
             "context_ms": context,
         }
         for label, context in CONTEXT_LEVELS
+    },
+    # Experiment 7: temporal ordering. Identical to E2_RLQ except that the feature
+    # sequence is permuted before the encoder.
+    **{
+        f"E7_{scope}_{label}": {
+            "variant": "RLAB",
+            "encoder": SELECTED_ENCODER,
+            "angular_algebra": "standard",
+            "angular_blocks": ["rotation"],
+            "angular_quaternions": 22,
+            "branch_width": 32,
+            "branches": ["radial", "linear", "angular"],
+            "shuffle": {"scope": target, "block_ms": block},
+        }
+        for scope, target in SHUFFLE_SCOPES
+        for label, block in SHUFFLE_LEVELS
     },
     # Temporal evolution of the angular representation (Temporal evolution 方案 §3).
     # All three use the SAME plain real temporal encoder; only the angular input changes.
@@ -591,6 +625,7 @@ def tables(root):
     factorial_tables(root, summary)
     representation_ablation_tables(root, summary)
     context_tables(root, summary)
+    ordering_tables(root, summary)
     return summary
 
 
@@ -1595,4 +1630,125 @@ def interpret_context(scores):
             f"Unrestricted minus 1280 ms is {scores[None] - scores[ordered[-1]]:+.4f}: "
             "whether the longest tested window already saturates."
         )
+    return "\n\n".join(lines)
+
+
+def ordering_tables(root, summary):
+    """Experiment 7: temporal ordering (plan section 8)."""
+    root = Path(root)
+    if not any(name in summary for name in ORDERING):
+        return None
+    rows = []
+    if ORDERING_ORIGINAL in summary:
+        rows.append(
+            [
+                "Original",
+                "--",
+                f"{summary[ORDERING_ORIGINAL]['parameters']:,}",
+                _cell(summary[ORDERING_ORIGINAL], "macro_auroc"),
+                _cell(summary[ORDERING_ORIGINAL], "macro_auprc"),
+                *[_cell(summary[ORDERING_ORIGINAL], cls) for cls in CLASSES],
+            ]
+        )
+    for scope, _ in SHUFFLE_SCOPES:
+        for label, _ in SHUFFLE_LEVELS:
+            name = f"E7_{scope}_{label}"
+            if name not in summary:
+                continue
+            rows.append(
+                [
+                    SHUFFLE_LABELS[label],
+                    SCOPE_LABELS[scope],
+                    f"{summary[name]['parameters']:,}",
+                    _cell(summary[name], "macro_auroc"),
+                    _cell(summary[name], "macro_auprc"),
+                    *[_cell(summary[name], cls) for cls in CLASSES],
+                ]
+            )
+    main = _table(["Condition", "Scope", "Params", "Macro AUROC", "Macro AUPRC", *CLASSES], rows)
+    losses = ""
+    if ORDERING_ORIGINAL in summary:
+        original = summary[ORDERING_ORIGINAL]["macro_auroc_mean"]
+        losses = _table(
+            ["Condition", "Scope", "Delta vs Original"],
+            [
+                [
+                    SHUFFLE_LABELS[label],
+                    SCOPE_LABELS[scope],
+                    f"{summary[f'E7_{scope}_{label}']['macro_auroc_mean'] - original:+.4f}",
+                ]
+                for scope, _ in SHUFFLE_SCOPES
+                for label, _ in SHUFFLE_LEVELS
+                if f"E7_{scope}_{label}" in summary
+            ],
+        )
+    text = (
+        "# Experiment 7: temporal ordering\n\n"
+        "Identical to R+L+Q in every respect except that the feature sequence is\n"
+        "permuted before the encoder. R, L and Q are built from the intact recording\n"
+        "first, so what a permutation destroys is the order of the dynamic states, not\n"
+        "the states themselves; shuffling the signal instead would corrupt the lagged\n"
+        "quantities as they are computed and would be testing something else.\n\n"
+        "A block shuffle permutes whole blocks and keeps the order inside each, so local\n"
+        "dynamics survive and longer-range organisation does not. The point-wise shuffle\n"
+        "breaks both. The joint scope applies ONE permutation to all three branches, so\n"
+        "cross-component alignment survives; permuting them independently would destroy\n"
+        "that as well and confound the result.\n\n"
+        "A fresh permutation is drawn per record so the model cannot learn to invert a\n"
+        "fixed one; in evaluation the draw is re-seeded so the reported metric is\n"
+        "reproducible. Where the length is not a whole number of blocks the remainder\n"
+        "stays at the end -- 40 of 5000 samples at 160 ms, the same tail in every\n"
+        f"condition. Seed 42, screening band {NOISE_BAND:.4f}.\n\n"
+        "## Table E7.1: Ordering conditions\n\n"
+        + main
+        + "\n\n"
+        + ("## Table E7.2: Cost of destroying order\n\n" + losses + "\n\n" if losses else "")
+        + "## Verdict\n\n"
+        + interpret_ordering(summary)
+        + "\n"
+    )
+    missing = [name for name in ORDERING if name not in summary]
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "ordering_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_ordering(summary):
+    """Original > block > point-wise would support temporal organisation carrying
+    information beyond a distribution of local states. The hierarchy is stated in
+    advance and not fitted to the result (plan section 8)."""
+    if ORDERING_ORIGINAL not in summary:
+        return "**Incomplete.** The Original condition (R+L+Q) has not been trained."
+    missing = [name for name in ORDERING if name not in summary]
+    if missing:
+        return f"**Incomplete.** Still to train: {', '.join(missing)}."
+    original = summary[ORDERING_ORIGINAL]["macro_auroc_mean"]
+    band = NOISE_BAND
+    lines = []
+    for scope, _ in SHUFFLE_SCOPES:
+        blocks = [summary[f"E7_{scope}_{label}"]["macro_auroc_mean"] for label, _ in SHUFFLE_LEVELS]
+        *block_scores, point = blocks
+        best_block = max(block_scores)
+        if original - point > band and best_block - point > band and original - best_block > band:
+            verdict = (
+                "Original > block > point-wise, each step clear of the band: temporal "
+                "organisation carries information beyond a distribution of local states."
+            )
+        elif original - point > band and original - best_block <= band:
+            verdict = (
+                "Block shuffles cost little but the point-wise shuffle costs "
+                f"{original - point:+.4f}: local dynamics matter, longer-range order "
+                "does not show a separable effect."
+            )
+        elif original - point <= band:
+            verdict = (
+                f"Even the point-wise shuffle costs only {original - point:+.4f}, inside "
+                "the band: at seed 42 ordering is not distinguishable from a bag of "
+                "local states."
+            )
+        else:
+            verdict = "The ordering is not monotone; seed 42 alone supports no claim."
+        lines.append(f"**{SCOPE_LABELS[scope]}.** {verdict}")
     return "\n\n".join(lines)
