@@ -34,7 +34,9 @@ from .data import CLASSES
 from .geometry import VCGGeometry
 from .quaternion_nn import TCNEncoder
 
-SINGLE_VARIANTS = ("M0", "M1", "M2", "M3", "M4")
+# Representation diagnostic of the v2 指导书 §3. All Real, single 20 ms scale.
+DIAGNOSTIC_VARIANTS = ("R", "RA", "RU", "RLA")
+SINGLE_VARIANTS = ("M0", "M1", "M2", "M3", "M4", *DIAGNOSTIC_VARIANTS)
 # F_n keeps M0 as an intact raw branch and adds M_n as a second branch (双分支方案 §2).
 FUSION_PAIRS = {"F1": "M1", "F2": "M2", "F3": "M3", "F4": "M4"}
 FUSION_VARIANTS = tuple(FUSION_PAIRS)
@@ -46,6 +48,30 @@ VARIANT_DEFAULTS = {
     "M2": {"feature": "first", "scales_ms": [20], "algebra": "quaternion"},
     "M3": {"feature": "first", "scales_ms": [10, 20, 40, 80], "algebra": "quaternion"},
     "M4": {"feature": "first_second", "scales_ms": [10, 20, 40, 80], "algebra": "quaternion"},
+    # r alone: how much diagnostic information does magnitude itself carry?
+    "R": {"feature": "composite", "blocks": ["radial"], "scales_ms": [20], "algebra": "real"},
+    # r + M1's angular relation: does magnitude restore what angular-only lost?
+    "RA": {
+        "feature": "composite",
+        "blocks": ["radial", "angular"],
+        "scales_ms": [20],
+        "algebra": "real",
+    },
+    # r + absolute direction: V = r * u, so this is a reparameterization of raw XYZ.
+    # Not a candidate model -- a representation audit (§4).
+    "RU": {
+        "feature": "composite",
+        "blocks": ["radial", "direction"],
+        "scales_ms": [20],
+        "algebra": "real",
+    },
+    # radial + linear + angular, the decomposition the cited work suggests.
+    "RLA": {
+        "feature": "composite",
+        "blocks": ["radial", "linear", "angular"],
+        "scales_ms": [20],
+        "algebra": "real",
+    },
 }
 
 
@@ -79,6 +105,9 @@ def model_settings(config):
     for key in ("feature", "scales_ms", "algebra"):
         if config.get(key) is not None:
             settings[key] = config[key]
+    settings.setdefault("blocks", [])
+    if settings["feature"] == "composite" and settings["algebra"] != "real":
+        raise ValueError("The representation diagnostic is Real only (v2 指导书 §1)")
     if settings["algebra"] not in ("real", "quaternion"):
         raise ValueError("algebra must be real or quaternion")
     if settings["algebra"] == "quaternion" and settings["feature"] == "raw":
@@ -105,6 +134,7 @@ class GeometryNet(nn.Module):
             stats["sampling_rate"],
             vcg_scale=stats["vcg_std"],
             renormalize=settings["renormalize"],
+            blocks=settings["blocks"],
         )
         width = 4 * settings["quaternions"] if quaternion else settings["real_width"]
         self.encoder = TCNEncoder(

@@ -109,3 +109,18 @@ def test_fusion_tables_are_generated(synthetic_cache):
     # The original four tables still exist and still describe only M0-M4.
     original = (root / "tables.md").read_text(encoding="utf-8")
     assert "Table 1" in original and "F1 Raw + Real Geo" not in original
+
+
+def test_duplicate_seed_error_names_the_directories(synthetic_cache):
+    """A manual run and a suite run of the same seed collide; say which ones."""
+    config = synthetic_cache[0]
+    root = Path(config["training"]["output"])
+    train(experiment_config(config, "M0"), run_name="M0_seed42")
+    evaluate(root / "M0_seed42" / "best.pt")
+    # `qdg train` without --run-name appends a timestamp, producing this shape.
+    train(experiment_config(config, "M0"), run_name="M0_seed42_20260101T000000Z")
+    evaluate(root / "M0_seed42_20260101T000000Z" / "best.pt")
+    with pytest.raises(ValueError, match="more than one completed run") as error:
+        tables(root)
+    assert "M0_seed42_20260101T000000Z" in str(error.value)
+    assert "seed 42" in str(error.value)

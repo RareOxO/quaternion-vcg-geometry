@@ -10,6 +10,7 @@ import math
 
 import torch
 
+from .geometry import KORS as VCG_KORS
 from .geometry import (
     first_order,
     hamilton_product,
@@ -184,3 +185,52 @@ def check_geometry(config, records=256):
             "cross_norm_mean": torch.linalg.vector_norm(q[..., 1:], dim=-1).mean().item(),
         }
     return report
+
+
+def feature_stats(config, records=256):
+    """Scale check for every diagnostic variant (v2 指导书 §11, §13 step 6).
+
+    Prints the p01/p50/p99 of each input block on a real batch, plus the parameter
+    count, so an input that would swamp the stem at initialization is visible before
+    anything is trained.
+    """
+    from .data import PTBXLDataset, load_manifest
+    from .experiments import DIAGNOSTIC, experiment_config
+    from .geometry import kors_transform
+    from .models import build_model
+
+    manifest = load_manifest(config["data"])
+    dataset = PTBXLDataset(config["data"]["cache"], "train", records, 0)
+    ecg = torch.stack([dataset[i]["ecg"] for i in range(len(dataset))])
+    report = {"records": len(dataset), "variants": {}}
+    vcg = kors_transform(ecg, torch.tensor(VCG_KORS))
+    magnitude = torch.linalg.vector_norm(vcg, dim=1)
+    velocity = torch.linalg.vector_norm(vcg[:, :, 1:] - vcg[:, :, :-1], dim=1)
+    report["raw_mv"] = {
+        "r": _quantiles(magnitude),
+        "abs_linear_velocity_per_sample": _quantiles(velocity),
+    }
+    for name in DIAGNOSTIC:
+        current = experiment_config(config, name)
+        model = build_model(current["model"], manifest["stats"]).eval()
+        with torch.inference_mode():
+            features = model.frontend(ecg)
+        if not torch.isfinite(features).all():
+            raise FloatingPointError(f"Nonfinite {name} features")
+        entry = {
+            "parameters": sum(p.numel() for p in model.parameters()),
+            "channels": features.shape[1],
+            "all_channels": _quantiles(features.abs()),
+        }
+        for block, (start, stop) in model.frontend.block_slices.items():
+            entry[block] = _quantiles(features[:, start:stop].abs())
+        report["variants"][name] = entry
+        del model
+    return report
+
+
+def _quantiles(x):
+    x = x.float().reshape(-1)
+    return {
+        q: round(x.quantile(v).item(), 5) for q, v in (("p01", 0.01), ("p50", 0.5), ("p99", 0.99))
+    }

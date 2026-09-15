@@ -83,6 +83,36 @@ python -m qdg suite --stage stage-a --seeds 42 43 44   # M0, M0-Wide, F1 — jud
 python -m qdg suite --stage fusion --seeds 42 43 44    # the whole ladder
 ```
 
+## Representation diagnostic (v2 addendum)
+
+Neither replacing raw XYZ with geometry nor adding geometry to it helps, so this stage
+stops adding structure and asks *where* the information is lost. All variants are Real,
+single 20 ms scale, seed 42 only.
+
+| Variant | Input | Ch | Question |
+|---|---|---|---|
+| R | `r = ‖V‖` | 1 | How much does magnitude alone carry? |
+| RA | `r` + M1's 20 ms `[dot,cross]` | 5 | Does magnitude restore the angular-only loss? |
+| RU | `r` + `u = V/(r+eps)` | 4 | Is `(r, u)` a lossless reparameterization of raw XYZ? |
+| RLA | `r` + linear `ΔV` + `[dot,cross]` | 8 | Does linear dynamics recover more? |
+
+RU is the audit, not a candidate: `V = r·u`, so if RU ≈ M0 while RA ≪ RU, the loss is in
+the `u → [dot,cross]` compression rather than in magnitude.
+
+Linear velocity is built on **raw XYZ**, never on `u`: §2 defines `l = (V_{t+1}−V_t)/dt`;
+the code emits `(V_{t+1}−V_t)/vcg_std`, which is that velocity divided by the constant
+`Fs·vcg_std`. Both scalers (`vcg_std`, and `r`'s `sqrt(Σ vcg_std²)`) come only from the
+training folds and are already in the existing cache, so no re-prepare is needed and
+amplitude is never removed. `qdg feature-stats` prints the p01/p50/p99 of every block.
+
+```bash
+python -m qdg feature-stats                          # scale check before training
+python -m qdg suite --stage diagnostic --seeds 42    # R, RA, RU, RLA; M0/M1 are reused
+```
+
+Results and the supported / partially supported / not supported verdict go to
+`runs/diagnostic_tables.md`.
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five

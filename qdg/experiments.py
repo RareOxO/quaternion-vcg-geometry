@@ -35,8 +35,35 @@ EXPERIMENTS = {
     "F2": {"variant": "F2"},
     "F3": {"variant": "F3"},
     "F4": {"variant": "F4"},
+    # Representation diagnostic (v2 指导书 §3). Real only, single 20 ms scale, seed 42.
+    "R": {"variant": "R"},
+    "RA": {"variant": "RA"},
+    "RU": {"variant": "RU"},
+    "RLA": {"variant": "RLA"},
 }
 MAIN = ("M0", "M1", "M2", "M3", "M4")
+# v2 指导书 §8: M0 and M1 are existing anchors, never retrained for this stage.
+DIAGNOSTIC = ("M0", "M1", "R", "RA", "RU", "RLA")
+DIAGNOSTIC_NEW = ("R", "RA", "RU", "RLA")
+DIAGNOSTIC_LABELS = {
+    "M0": "XYZ",
+    "M1": "Angular [dot,cross]",
+    "R": "Radial",
+    "RA": "Radial + Angular",
+    "RU": "Radial + Absolute Direction",
+    "RLA": "Radial + Linear + Angular",
+}
+# v2 指导书 §8. Each entry is (label, new, old, what the difference asks).
+DIAGNOSTIC_DIFFS = (
+    ("RA - M1", "RA", "M1", "How much does adding magnitude restore?"),
+    ("RU - M0", "RU", "M0", "Cost of the (r, u) reparameterization of raw XYZ"),
+    ("RA - RU", "RA", "RU", "Cost of relative angular compression vs absolute direction"),
+    ("RLA - RA", "RLA", "RA", "Does linear dynamics recover anything further?"),
+    ("RLA - M0", "RLA", "M0", "Gap from the full decomposition to the raw baseline"),
+)
+# Seed spread of the completed three-seed runs is 0.0002-0.0031 Macro AUROC, so an
+# effect under this band is not distinguishable at seed=42 only (v2 指导书 §9).
+NOISE_BAND = 0.005
 FUSION = ("M0", "M0_wide", "F1", "F2", "F3", "F4")
 # 双分支方案 §12: train M0 / M0_wide / F1 first and stop for a decision on F1.
 FUSION_STAGE_A = ("M0", "M0_wide", "F1")
@@ -142,18 +169,32 @@ def suite(config, names, seeds):
 
 
 def collect(root):
-    """experiment name -> per-seed test results, one entry per completed run."""
-    groups = {}
+    """experiment name -> per-seed test results, one entry per completed run.
+
+    A run directory is named `<experiment>_seed<n>`; `qdg train` without --run-name
+    appends a timestamp, so a manual run can collide with a suite run of the same
+    seed. That is ambiguous rather than wrong, so it is an error -- but the message
+    has to name the directories, or there is no way to act on it.
+    """
+    groups, sources = {}, {}
     for path in sorted(Path(root).rglob("best_test_metrics.json")):
         result = json.loads(path.read_text())
         if result["limited_evaluation"] or result["smoke_training"]:
             continue
         name = path.parent.name.rsplit("_seed", 1)[0]
         groups.setdefault(name, []).append(result)
-    for name, results in groups.items():
-        seeds = [result["seed"] for result in results]
-        if len(set(seeds)) != len(seeds):
-            raise ValueError(f"Duplicate seeds for {name}: {seeds}")
+        sources.setdefault(name, {}).setdefault(result["seed"], []).append(path.parent)
+    for name, by_seed in sources.items():
+        clashes = {seed: dirs for seed, dirs in by_seed.items() if len(dirs) > 1}
+        if clashes:
+            detail = "; ".join(
+                f"seed {seed}: " + ", ".join(str(d) for d in dirs)
+                for seed, dirs in sorted(clashes.items())
+            )
+            raise ValueError(
+                f"{name} has more than one completed run for the same seed ({detail}). "
+                "Move or delete the run you do not want summarized, then rerun."
+            )
     return groups
 
 
@@ -283,6 +324,7 @@ def tables(root):
         writer.writerows(rows)
     print(text, flush=True)
     fusion_tables(root, summary)
+    diagnostic_tables(root, summary)
     return summary
 
 
@@ -362,5 +404,112 @@ def fusion_tables(root, summary):
     if missing:
         text += f"\nNot yet trained: {', '.join(missing)}\n"
     (root / "fusion_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret(gap):
+    """Map the observed differences onto the v2 指导书 §9 decision table.
+
+    Returns (verdict, pattern, next step). The thresholds are NOISE_BAND, which is set
+    from the seed spread already measured on the completed three-seed runs; at seed=42
+    only there is no per-variant standard deviation to test against, so anything inside
+    the band is reported as indistinguishable rather than as an effect.
+    """
+    band = NOISE_BAND
+    ra_m1, ru_m0 = gap.get("RA - M1"), gap.get("RU - M0")
+    ra_ru, rla_ra = gap.get("RA - RU"), gap.get("RLA - RA")
+    if any(value is None for value in (ra_m1, ru_m0, ra_ru, rla_ra)):
+        return "incomplete", "Not every diagnostic variant has a result yet.", "Finish stage one."
+    if ru_m0 < -band and ra_m1 < band and rla_ra < band:
+        return (
+            "not supported",
+            "Even RU, an information-preserving reparameterization of raw XYZ, is well "
+            "below M0, so the shortfall is not explained by what the representation drops.",
+            "Audit normalization/scaling before any new model; do not add structure.",
+        )
+    if ra_m1 > band and abs(ru_m0) <= band and ra_ru < -band:
+        return (
+            "partially supported",
+            "Magnitude restores part of the angular-only loss and RU matches M0, but RA "
+            "stays below RU, so the remaining loss is in the u -> [dot,cross] compression.",
+            "Stop elaborating [dot,cross]; study representations that keep absolute direction.",
+        )
+    if ra_m1 > band and rla_ra <= band:
+        return (
+            "supported",
+            "Adding magnitude alone recovers a large part of the angular-only gap.",
+            "Add seeds 43/44 for R, RA, RU; then consider magnitude-aware angular modelling.",
+        )
+    if ra_m1 <= band and rla_ra > band:
+        return (
+            "partially supported",
+            "Magnitude alone changes little, but linear displacement dynamics recover more, "
+            "so the missing information is in the linear rather than the radial term.",
+            "Add seeds 43/44 for RLA and a parameter-matched raw control.",
+        )
+    if ra_m1 <= band and rla_ra <= band and ru_m0 >= -band:
+        return (
+            "not supported",
+            "No diagnostic variant improves beyond the seed noise band, yet RU reproduces "
+            "M0, so raw XYZ is not being beaten by anything these blocks expose.",
+            "Drop this line; look at raw morphology, phase-specific or robustness questions.",
+        )
+    return (
+        "partially supported",
+        "The differences do not match a single pattern in the decision table cleanly.",
+        "Inspect the per-class table before committing to a second stage.",
+    )
+
+
+def diagnostic_tables(root, summary):
+    """Tables of the v2 指导书 §8/§15, written to diagnostic_tables.md."""
+    root = Path(root)
+    if not any(name in summary for name in DIAGNOSTIC_NEW):
+        return None
+    present = [name for name in DIAGNOSTIC if name in summary]
+    main = _table(
+        ["Model", "Representation", "Params", "Macro AUROC", *CLASSES],
+        [
+            [
+                name,
+                DIAGNOSTIC_LABELS[name],
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+            for name in present
+        ],
+    )
+    gap = {
+        label: summary[new]["macro_auroc_mean"] - summary[old]["macro_auroc_mean"]
+        for label, new, old, _ in DIAGNOSTIC_DIFFS
+        if new in summary and old in summary
+    }
+    diffs = _table(
+        ["Comparison", "Question", "Delta Macro AUROC"],
+        [
+            [label, question, f"{gap[label]:+.4f}"]
+            for label, new, old, question in DIAGNOSTIC_DIFFS
+            if label in gap
+        ],
+    )
+    verdict, pattern, nxt = interpret(gap)
+    missing = [name for name in DIAGNOSTIC if name not in summary]
+    text = (
+        "# Representation diagnostic: radial / direction / linear / angular\n\n"
+        "Test fold 10, thresholds fixed at 0.5. Stage one is seed 42 only, so no\n"
+        "standard deviation is available and differences are read against a\n"
+        f"{NOISE_BAND:.4f} noise band taken from the completed three-seed runs.\n"
+        "All variants are Real; no QuaternionConv, multi-scale or second-order.\n\n"
+        "## Table 8: Diagnostic results\n\n" + main + "\n\n"
+        "## Table 9: Component differences\n\n" + diffs + "\n\n"
+        "## Verdict\n\n"
+        f"**Assumption: {verdict}.** {pattern}\n\n"
+        f"Suggested next step: {nxt}\n"
+    )
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "diagnostic_tables.md").write_text(text, encoding="utf-8")
     print(text, flush=True)
     return text

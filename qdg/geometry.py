@@ -24,7 +24,10 @@ KORS = (
     (-0.07, 0.93, 0.06, -0.02, -0.05, 0.06, -0.17, 0.13),
     (0.11, -0.23, -0.43, -0.06, -0.14, -0.20, -0.11, 0.31),
 )
-FEATURES = ("raw", "first", "first_second")
+FEATURES = ("raw", "first", "first_second", "composite")
+# Real-valued blocks of the representation diagnostic (v2 指导书 §2). Concatenated in
+# this canonical order, so a block always occupies the same channel slice.
+BLOCKS = ("radial", "direction", "linear", "angular")
 
 
 def kors_transform(ecg, matrix):
@@ -76,6 +79,31 @@ def relation_descriptor(u, v):
     """The study's descriptor q = [+u.v, u x v] (方案 §4.1), on broadcastable (..., 3)."""
     u, v = torch.broadcast_tensors(u, v)
     return torch.cat(((u * v).sum(-1, keepdim=True), torch.linalg.cross(u, v)), dim=-1)
+
+
+def radial_magnitude(v):
+    """(..., 3) -> (..., 1) radial magnitude r = ||V||_2. Carries the amplitude that
+    `unit_direction` divides away; never normalized per record (v2 指导书 §6)."""
+    return torch.linalg.vector_norm(v, dim=-1, keepdim=True)
+
+
+def linear_velocity(v):
+    """(..., T, 3) -> (..., T, 3) forward difference of the RAW vector, edge-replicated.
+
+    v2 指导书 §2 defines l_t = (V_{t+1} - V_t) / dt with dt = 1 / Fs. This returns the
+    bare difference V_{t+1} - V_t; the caller multiplies by the constant it needs. It
+    must be built on raw XYZ, never on the normalized direction u.
+    """
+    return _pad_edges3(v[..., 1:, :] - v[..., :-1, :], 0, 1)
+
+
+def _pad_edges3(x, left, right):
+    """Edge replication for (..., T, 3), matching the convention `_pad_edges` uses."""
+    parts = [x[..., :1, :].expand(*x.shape[:-2], left, 3)] if left else []
+    parts.append(x)
+    if right:
+        parts.append(x[..., -1:, :].expand(*x.shape[:-2], right, 3))
+    return torch.cat(parts, dim=-2)
 
 
 def lag_samples(lag_ms, sampling_rate):
@@ -133,16 +161,29 @@ class VCGGeometry(nn.Module):
         vcg_scale=None,
         eps=1e-8,
         renormalize=False,
+        blocks=(),
     ):
         super().__init__()
         if feature not in FEATURES:
             raise ValueError(f"feature must be one of {FEATURES}")
         scales_ms = tuple(scales_ms)
+        blocks = tuple(blocks)
         if feature == "raw":
             if scales_ms:
                 raise ValueError("Raw VCG input takes no temporal scales")
         elif not scales_ms or len(set(scales_ms)) != len(scales_ms):
             raise ValueError("Geometry features need unique temporal scales")
+        if feature == "composite":
+            if not blocks or len(set(blocks)) != len(blocks):
+                raise ValueError("A composite feature needs unique blocks")
+            if any(block not in BLOCKS for block in blocks):
+                raise ValueError(f"blocks must be drawn from {BLOCKS}")
+            if len(scales_ms) != 1:
+                raise ValueError("The composite diagnostic fixes a single 20 ms scale")
+        elif blocks:
+            raise ValueError("blocks only apply to a composite feature")
+        # Canonical order, so a block always occupies the same channel slice.
+        self.blocks = tuple(block for block in BLOCKS if block in blocks)
         self.feature, self.scales_ms, self.eps = feature, scales_ms, eps
         self.sampling_rate = sampling_rate
         # Explicit configuration: re-normalization is never applied silently (方案 §4.3).
@@ -151,16 +192,40 @@ class VCGGeometry(nn.Module):
         self.register_buffer("kors", torch.tensor(KORS, dtype=torch.float32))
         scale = torch.ones(3) if vcg_scale is None else torch.tensor(vcg_scale, dtype=torch.float32)
         self.register_buffer("vcg_scale", scale.view(1, 3, 1))
+        # RMS of r over the training folds, exactly sqrt(sum of the per-axis RMS squares)
+        # since vcg_std is itself an uncentred training-fold RMS. Derived from the cache
+        # that already exists, so no re-prepare and no new normalization recipe (§6).
+        # persistent=False: derived entirely from vcg_scale, so it must never enter
+        # state_dict -- an earlier checkpoint has to keep loading with strict=True.
+        self.register_buffer(
+            "radial_scale", scale.square().sum().sqrt().view(1, 1, 1), persistent=False
+        )
+
+    BLOCK_CHANNELS = {"radial": 1, "direction": 3, "linear": 3, "angular": 4}
 
     @property
     def quaternion_channels(self):
-        if self.feature == "raw":
+        if self.feature in ("raw", "composite"):
             return 0
         return len(self.lags) * (2 if self.feature == "first_second" else 1)
 
     @property
+    def block_slices(self):
+        """block name -> (start, stop) channel indices, for the per-block unit tests."""
+        slices, start = {}, 0
+        for block in self.blocks:
+            stop = start + self.BLOCK_CHANNELS[block]
+            slices[block] = (start, stop)
+            start = stop
+        return slices
+
+    @property
     def out_channels(self):
-        return 3 if self.feature == "raw" else 4 * self.quaternion_channels
+        if self.feature == "raw":
+            return 3
+        if self.feature == "composite":
+            return sum(self.BLOCK_CHANNELS[block] for block in self.blocks)
+        return 4 * self.quaternion_channels
 
     def forward(self, ecg):
         # Geometry is always float32: cosines near +-1 are the point of the representation.
@@ -169,6 +234,8 @@ class VCGGeometry(nn.Module):
             if self.feature == "raw":
                 return vcg / self.vcg_scale
             u = unit_direction(vcg.transpose(1, 2), self.eps)
+            if self.feature == "composite":
+                return self._composite(vcg, u)
             channels = [first_order(u, lag) for lag in self.lags]
             if self.renormalize:
                 channels = [
@@ -181,3 +248,30 @@ class VCGGeometry(nn.Module):
             # (B, Q, T, 4) -> component-major (B, 4 * Q, T)
             stacked = torch.stack(channels, dim=1)
             return stacked.permute(0, 3, 1, 2).flatten(1, 2)
+
+    def _composite(self, vcg, u):
+        """Real concatenation of the diagnostic blocks, (B, C, T) in canonical order.
+
+        Scaling is by training-fold constants only, and is a pure per-axis rescale, so
+        no information is added or removed:
+          radial  r / RMS_train(r)
+          linear  (V_{t+1} - V_t) / vcg_std, i.e. the §2 velocity (V_{t+1}-V_t)/dt
+                  divided by the constant Fs * vcg_std
+          direction, angular  already bounded, left alone
+        """
+        parts = []
+        for block in self.blocks:
+            if block == "radial":
+                parts.append(
+                    radial_magnitude(vcg.transpose(1, 2)).transpose(1, 2) / self.radial_scale
+                )
+            elif block == "direction":
+                parts.append(u.transpose(1, 2))
+            elif block == "linear":
+                velocity = linear_velocity(vcg.transpose(1, 2)).transpose(1, 2)
+                parts.append(velocity / self.vcg_scale)
+            else:
+                # Bit-identical to the M1 input: one quaternion channel is already
+                # [dot, cross_x, cross_y, cross_z] in component-major order.
+                parts.append(first_order(u, self.lags[0]).transpose(1, 2))
+        return torch.cat(parts, dim=1)

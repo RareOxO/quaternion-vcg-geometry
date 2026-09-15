@@ -7,6 +7,7 @@ from .data import audit, prepare
 from .engine import evaluate, train
 from .experiments import (
     EXPERIMENTS,
+    DIAGNOSTIC_NEW,
     FUSION,
     FUSION_STAGE_A,
     experiment_config,
@@ -14,7 +15,7 @@ from .experiments import (
     suite,
     tables,
 )
-from .sanity import check_geometry, sanity_checks
+from .sanity import check_geometry, feature_stats, sanity_checks
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "base.yaml"
 
@@ -22,12 +23,21 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "base.yaml"
 def main():
     parser = argparse.ArgumentParser(description="Quaternion-VCG dynamic geometry on PTB-XL")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("audit", "prepare", "sanity", "check-geometry", "profile", "train", "suite"):
+    for command in (
+        "audit",
+        "prepare",
+        "sanity",
+        "check-geometry",
+        "feature-stats",
+        "profile",
+        "train",
+        "suite",
+    ):
         sub = subparsers.add_parser(command)
         sub.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-        if command in ("check-geometry", "profile", "train", "suite"):
+        if command in ("check-geometry", "feature-stats", "profile", "train", "suite"):
             sub.add_argument("--device")
-        if command == "check-geometry":
+        if command in ("check-geometry", "feature-stats"):
             sub.add_argument("--records", type=int, default=256)
         if command in ("train", "suite"):
             sub.add_argument("--epochs", type=int)
@@ -45,8 +55,9 @@ def main():
             # before F2-F4 are spent.
             group.add_argument(
                 "--stage",
-                choices=("stage-a", "fusion"),
-                help="stage-a: M0, M0_wide, F1 only; fusion: the whole F ladder",
+                choices=("stage-a", "fusion", "diagnostic"),
+                help="stage-a: M0, M0_wide, F1; fusion: the F ladder; "
+                "diagnostic: R, RA, RU, RLA (M0/M1 are reused, never retrained)",
             )
             sub.add_argument("--seeds", nargs="+", type=int, default=[42])
     evaluation = subparsers.add_parser("evaluate")
@@ -82,10 +93,16 @@ def main():
             result = prepare(config["data"])
         elif args.command == "check-geometry":
             result = check_geometry(config, args.records)
+        elif args.command == "feature-stats":
+            result = feature_stats(config, args.records)
         elif args.command == "profile":
             result = profile(config)
         elif args.command == "suite":
-            stage = {"stage-a": list(FUSION_STAGE_A), "fusion": list(FUSION)}
+            stage = {
+                "stage-a": list(FUSION_STAGE_A),
+                "fusion": list(FUSION),
+                "diagnostic": list(DIAGNOSTIC_NEW),
+            }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)
         else:

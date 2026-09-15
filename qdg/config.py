@@ -3,7 +3,7 @@ from pathlib import Path
 
 import yaml
 
-from .geometry import FEATURES, lag_samples
+from .geometry import BLOCKS, FEATURES, lag_samples
 from .models import VARIANTS
 
 
@@ -44,6 +44,10 @@ def validate_config(config):
         raise ValueError(f"model.variant must be one of {VARIANTS}")
     if model.get("feature") is not None and model["feature"] not in FEATURES:
         raise ValueError(f"model.feature must be one of {FEATURES}")
+    blocks = model.get("blocks")
+    if blocks is not None:
+        if len(set(blocks)) != len(blocks) or any(b not in BLOCKS for b in blocks):
+            raise ValueError(f"model.blocks must be unique values drawn from {BLOCKS}")
     if model.get("operator", "conv") not in ("conv", "mlp"):
         raise ValueError("model.operator must be conv or mlp")
     if model.get("algebra") is not None and model["algebra"] not in ("real", "quaternion"):
