@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from qdg.config import load_config, validate_config
+from qdg.data import CLASSES
 from qdg.experiments import (
     COMBINED,
     HANDCRAFTED,
@@ -211,6 +212,32 @@ def test_single_context_models_keep_their_parameter_names(full_config):
             assert not hasattr(encoder, "members")
     combined = _model(full_config, COMBINED)
     assert any("members." in key for key in combined.state_dict())
+
+
+def test_the_table_names_the_classifier_each_arm_actually_used(tmp_path):
+    """A, B and C are scikit-learn on fixed features -- they never run E*.
+
+    The settings were dropped on the way into the summary, so every row fell back to
+    the label for the proposed model and the table read as though all five arms used
+    the sequence encoder.
+    """
+    from qdg.experiments import handcrafted_tables
+
+    def row(values, settings=None):
+        out = {"parameters": 1, "macro_auroc_mean": values, "macro_auroc_std": None}
+        out.update({f"{key}_mean": values for key in ("macro_auprc", *CLASSES)})
+        out.update({f"{key}_std": None for key in ("macro_auprc", *CLASSES)})
+        return out if settings is None else {**out, "settings": settings}
+
+    summary = {
+        "E5_stat": row(0.80, {"selected_classifier": "mlp", "embedding_checkpoint": None}),
+        "E2_RLQ": row(0.90),
+        "E5_hybrid": row(0.90, {"selected_classifier": "logistic", "embedding_checkpoint": "b.pt"}),
+    }
+    text = handcrafted_tables(tmp_path, summary)
+    assert "| A  statistical aggregation | MLP (64 hidden) |" in text
+    assert "| E  Proposed + handcrafted | Logistic Regression on E* |" in text
+    assert "| D  Proposed full-sequence learning | E* (LSTM + Attention) |" in text
 
 
 def test_verdicts():

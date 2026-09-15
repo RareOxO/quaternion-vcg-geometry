@@ -542,7 +542,7 @@ def aggregate(results):
     """Mean and std over seeds of macro and per-class AUROC at fixed thresholds."""
     row = {"n_seeds": len(results), "seeds": sorted(r["seed"] for r in results)}
     row["parameters"] = results[0]["parameters"]
-    for key in ("classifier_parameters", "frozen_parameters"):
+    for key in ("classifier_parameters", "frozen_parameters", "settings"):
         if key in results[0]:
             row[key] = results[0][key]
     values = {"macro_auroc": [], "macro_auprc": []}
@@ -1818,6 +1818,23 @@ def interpret_ordering(summary):
     return "\n\n".join(lines)
 
 
+CLASSIFIER_LABELS = {"logistic": "Logistic Regression", "mlp": "MLP (64 hidden)"}
+
+
+def _classifier_cell(row):
+    """Which classifier the row actually used.
+
+    Only D is the sequence model; A, B and C are a scikit-learn classifier on fixed
+    features and must not be printed as though they ran E*.
+    """
+    settings = row.get("settings") or {}
+    chosen = settings.get("selected_classifier")
+    if chosen is None:
+        return f"E* ({BENCHMARK_LABELS[SELECTED_ENCODER]})"
+    label = CLASSIFIER_LABELS.get(chosen, chosen)
+    return f"{label} on E*" if settings.get("embedding_checkpoint") else label
+
+
 def _parameter_cell(row):
     """Fitted parameters, plus whatever is frozen upstream, kept apart."""
     frozen = row.get("frozen_parameters")
@@ -1838,11 +1855,10 @@ def handcrafted_tables(root, summary):
     for label, name in HANDCRAFTED:
         if name not in summary:
             continue
-        settings = summary[name].get("settings") or {}
         rows.append(
             [
                 label,
-                settings.get("selected_classifier", f"E* ({BENCHMARK_LABELS[SELECTED_ENCODER]})"),
+                _classifier_cell(summary[name]),
                 _parameter_cell(summary[name]),
                 _cell(summary[name], "macro_auroc"),
                 _cell(summary[name], "macro_auprc"),

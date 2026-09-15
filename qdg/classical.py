@@ -79,13 +79,18 @@ def feature_columns(config, kinds):
     return features[:, columns]
 
 
-def embeddings(config, checkpoint, split, indices, device):
-    """Pre-classifier embedding of the proposed model, for the hybrid arm."""
+def frozen_model(checkpoint, device):
+    """The proposed model restored from its checkpoint, for the hybrid arm to read."""
     from .models import build_model
 
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     model = build_model(state["config"]["model"], state["stats"]).to(device).eval()
     model.load_state_dict(state["model"])
+    return model
+
+
+def embeddings(model, config, split, indices, device):
+    """Pre-classifier embedding of the proposed model, for the hybrid arm."""
     dataset = PTBXLDataset(config["data"]["cache"], split)
     out = []
     with torch.inference_mode():
@@ -121,17 +126,20 @@ def run_classical(config, name, kinds, checkpoint=None, device="cpu"):
     }
     manifest = load_manifest(config["data"])
     matrix = feature_columns(config, kinds) if kinds else None
-    frozen = 0
+    frozen, model_frozen = 0, None
     if checkpoint is not None:
-        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        frozen = sum(value.numel() for value in state["model"].values())
+        model_frozen = frozen_model(checkpoint, device)
+        # Learned weights only. The checkpoint also stores fixed constants -- the Kors
+        # matrix and the normalisation scale -- and counting those would print a larger
+        # number here than row D prints for the very same model.
+        frozen = sum(parameter.numel() for parameter in model_frozen.parameters())
     parts = {}
     for split, dataset in splits.items():
         pieces = []
         if matrix is not None:
             pieces.append(matrix[dataset.indices])
         if checkpoint is not None:
-            pieces.append(embeddings(config, checkpoint, split, dataset.indices, device))
+            pieces.append(embeddings(model_frozen, config, split, dataset.indices, device))
         parts[split] = np.concatenate(pieces, axis=1)
     labels = {split: dataset.labels[dataset.indices] for split, dataset in splits.items()}
     # Fitted on the training folds only; validation and test are transformed, never fitted.
@@ -162,13 +170,13 @@ def run_classical(config, name, kinds, checkpoint=None, device="cpu"):
             "selected_classifier": best,
             "embedding_checkpoint": str(checkpoint) if checkpoint else None,
         },
-        # The classifier's own coefficients, and separately anything frozen upstream of
-        # it. Reporting only the former would put 915 next to the proposed model's
-        # 62,617 and read as though a far smaller model had matched it, when the hybrid
-        # arm runs that same model first and then fits a head on top.
-        "classifier_parameters": int(sum(values.size for values in _coefficients(model))),
+        # What the classifier itself fits, and separately what is frozen upstream of it.
+        # Reporting only the former would put a three-digit number next to the proposed
+        # model's 62,617 and read as though a far smaller model had matched it, when the
+        # hybrid arm runs that same model first and then fits a head on top.
+        "classifier_parameters": int(sum(values.size for values in _fitted(model))),
         "frozen_parameters": int(frozen),
-        "parameters": int(sum(values.size for values in _coefficients(model)) + frozen),
+        "parameters": int(sum(values.size for values in _fitted(model)) + frozen),
         "sampling_rate": manifest["stats"]["sampling_rate"],
         "input_channels": int(parts["train"].shape[1]),
         "receptive_field_samples": None,
@@ -201,10 +209,15 @@ def run_classical(config, name, kinds, checkpoint=None, device="cpu"):
     return result
 
 
-def _coefficients(model):
+def _fitted(model):
+    """Every number the classifier fits, intercepts included.
+
+    The neural rows count their biases, so these rows count theirs.
+    """
     for estimator in model.estimators_:
         if hasattr(estimator, "coef_"):
             yield estimator.coef_
+            yield np.atleast_1d(estimator.intercept_)
         else:
-            for weights in estimator.coefs_:
-                yield weights
+            yield from estimator.coefs_
+            yield from estimator.intercepts_
