@@ -236,6 +236,14 @@ def build_model(config, stats):
 
 
 BRANCH_BLOCKS = ("radial", "linear", "angular")
+# Angular representations of the Temporal evolution 方案 §3. A1 and A2 share operands
+# and differ only in how the two local rotations are combined: subtraction in R^4
+# versus composition in the rotation group.
+ANGULAR_BLOCKS = {
+    "A0": ["rotation"],
+    "A1": ["rotation", "rotation_delta"],
+    "A2": ["rotation", "rotation_evolution"],
+}
 
 
 class BranchedRLANet(nn.Module):
@@ -269,6 +277,12 @@ class BranchedRLANet(nn.Module):
         # 4Q for the quaternion encoder, 2Q for the standard one: a quaternion conv holds
         # 4*Q^2*K weights and a real conv of width W holds W^2*K, so W = 2Q equalizes them.
         angular_width = 4 * quaternions if algebra == "quaternion" else 2 * quaternions
+        angular_blocks = config.get("angular_blocks") or ["angular"]
+        branch_blocks = {
+            "radial": ["radial"],
+            "linear": ["linear"],
+            "angular": list(angular_blocks),
+        }
         self.frontends = nn.ModuleDict(
             {
                 block: VCGGeometry(
@@ -276,7 +290,8 @@ class BranchedRLANet(nn.Module):
                     config.get("scales_ms") or [20],
                     stats["sampling_rate"],
                     vcg_scale=stats["vcg_std"],
-                    blocks=[block],
+                    blocks=branch_blocks[block],
+                    tau_ms=config.get("tau_ms"),
                 )
                 for block in BRANCH_BLOCKS
             }
@@ -310,6 +325,8 @@ class BranchedRLANet(nn.Module):
             "angular_width": angular_width,
             "branch_width": branch_width,
             "fusion_dim": dim,
+            "angular_blocks": list(angular_blocks),
+            "tau_ms": self.frontends["angular"].tau_ms,
             "scales_ms": list(config.get("scales_ms") or [20]),
             **shared,
         }

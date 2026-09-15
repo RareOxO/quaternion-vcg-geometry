@@ -169,6 +169,41 @@ python -m qdg suite --stage angular --seeds 42
 
 Results and verdict go to `runs/angular_tables.md`.
 
+## Quaternion temporal evolution of the angular representation
+
+The first round in this project to use a **genuine rotation quaternion**. Everything
+before used the full-angle `[dot, cross]` descriptor and explicitly refused to call it
+a rotation; here `q_t = Rotation(u_t → u_{t+Δ})` is the standard half-angle form, so
+composition in the rotation group is actually meaningful.
+
+| Variant | Angular input | Ch | Question |
+|---|---|---|---|
+| A0 | `q_t` | 4 | local rotation only |
+| A1 | `q_t`, `q_{t+τ} − q_t` | 8 | plain temporal difference |
+| A2 | `q_t`, `q_t⁻¹ ⊗ q_{t+τ}` | 8 | rotation-group composition |
+
+**A1 vs A2 is the question**: same two operands, subtraction in R⁴ versus composition
+in the rotation group. Their parameter counts are exactly equal (80,388 angular,
+168,905 total). A0 is the local-only floor and differs only in the stem (0.52%).
+`τ = Δ = 20 ms` is fixed — the plan forbids searching it alongside Δ and the RF.
+
+`q_t` is built without trigonometry as `[1 + u·v, u×v]` normalized, which is exactly
+`[cos(θ/2), n sin(θ/2)]` and automatically satisfies the `w ≥ 0` sign convention, so no
+artificial sign flips appear in time. Antiparallel inputs collapse both parts to zero;
+there the rotation is π about any perpendicular axis and one is chosen deterministically.
+
+`e_t = q_t⁻¹ ⊗ q_{t+τ}` is a real relative rotation, expressed in `q_t`'s own frame;
+`q_{t+τ} − q_t` is a coordinate-wise difference with no rotation-group meaning. The two
+are never described interchangeably. **No QuaternionConv is used anywhere this round** —
+all three share one plain real temporal encoder, so this tests the representation, not
+the operator.
+
+```bash
+python -m qdg suite --stage evolution --seeds 42
+```
+
+Results and verdict go to `runs/evolution_tables.md`.
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five

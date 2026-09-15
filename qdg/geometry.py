@@ -27,7 +27,17 @@ KORS = (
 FEATURES = ("raw", "first", "first_second", "composite")
 # Real-valued blocks of the representation diagnostic (v2 指导书 §2). Concatenated in
 # this canonical order, so a block always occupies the same channel slice.
-BLOCKS = ("radial", "direction", "linear", "angular")
+BLOCKS = (
+    "radial",
+    "direction",
+    "linear",
+    "angular",
+    # Rotation-quaternion blocks (Temporal evolution 方案 §2). Unlike `angular`, these
+    # are genuine half-angle rotation quaternions, so composition is meaningful.
+    "rotation",
+    "rotation_delta",
+    "rotation_evolution",
+)
 
 
 def kors_transform(ecg, matrix):
@@ -139,6 +149,79 @@ def second_order(u, lag):
     return _pad_edges(following - previous, lag, lag)
 
 
+def canonical_sign(q):
+    """Flip q so its scalar part is non-negative. q and -q are the same rotation, so
+    this removes a sign ambiguity that would otherwise look like a jump in time (§5)."""
+    return torch.where(q[..., :1] < 0, -q, q)
+
+
+def rotation_quaternion(u, v, degenerate_threshold=1e-3, eps=1e-12):
+    """Minimal rotation taking unit u to unit v, as a HALF-angle quaternion (§2).
+
+    This is the standard physical rotation quaternion [cos(theta/2), n sin(theta/2)] --
+    a different object from `relation_descriptor`, which is the full-angle
+    [cos theta, n sin theta] used by M1-M4 and never composable as a rotation.
+
+    Built without trigonometry from the identity
+
+        [1 + u.v, u x v] / || [1 + u.v, u x v] ||  ==  [cos(theta/2), n sin(theta/2)]
+
+    since the norm is sqrt(2(1 + u.v)) = 2 cos(theta/2). The scalar part 1 + u.v is
+    never negative, so the result already satisfies the w >= 0 sign convention.
+
+    Antiparallel inputs (theta -> pi) collapse both parts to zero; there the rotation is
+    pi about any axis perpendicular to u, so one is chosen deterministically from the
+    coordinate axis least aligned with u. Parallel inputs need no special case: the
+    scalar dominates and the result tends to the identity [1, 0, 0, 0].
+    """
+    u, v = torch.broadcast_tensors(u, v)
+    dot = (u * v).sum(-1, keepdim=True)
+    raw = torch.cat((1 + dot, torch.linalg.cross(u, v)), dim=-1)
+    norm = torch.linalg.vector_norm(raw, dim=-1, keepdim=True)
+    # Deterministic perpendicular axis for the antiparallel case.
+    index = u.abs().argmin(-1, keepdim=True)
+    basis = torch.zeros_like(u).scatter(-1, index, 1.0)
+    perpendicular = torch.linalg.cross(u, basis)
+    perpendicular = perpendicular / (
+        torch.linalg.vector_norm(perpendicular, dim=-1, keepdim=True) + eps
+    )
+    fallback = torch.cat((torch.zeros_like(dot), perpendicular), dim=-1)
+    return torch.where(norm < degenerate_threshold, fallback, raw / norm.clamp_min(eps))
+
+
+def local_rotation(u, lag):
+    """q_t = Rotation(u_t -> u_{t+lag}), placed at t, (..., T, 3) -> (..., T, 4)."""
+    if lag >= u.shape[-2]:
+        raise ValueError("Lag is not shorter than the signal")
+    return _pad_edges(rotation_quaternion(u[..., :-lag, :], u[..., lag:, :]), 0, lag)
+
+
+def rotation_difference(q, tau):
+    """q_{t+tau} - q_t: a coordinate-wise difference in R^4.
+
+    Deliberately NOT a rotation. It is the plain temporal difference control of §3, and
+    must never be described as a relative rotation (§5).
+    """
+    if tau >= q.shape[-2]:
+        raise ValueError("Tau is not shorter than the signal")
+    return _pad_edges(q[..., tau:, :] - q[..., :-tau, :], 0, tau)
+
+
+def rotation_evolution(q, tau):
+    """e_t = q_t^-1 (x) q_{t+tau}: the relative rotation from one local rotation to the next.
+
+    This one IS a rotation: it is the group element carrying the frame of q_t onto that
+    of q_{t+tau}, expressed in q_t's own frame. That is the whole contrast with
+    `rotation_difference` -- same two operands, composition instead of subtraction.
+    """
+    if tau >= q.shape[-2]:
+        raise ValueError("Tau is not shorter than the signal")
+    previous, following = q[..., :-tau, :], q[..., tau:, :]
+    # q is unit by construction, so the inverse is the conjugate.
+    evolution = hamilton_product(quaternion_conjugate(previous), following)
+    return _pad_edges(canonical_sign(evolution), 0, tau)
+
+
 def relation_norm_error(q):
     """max | ||q|| - 1 |. First-order descriptors satisfy dot^2 + ||cross||^2 = 1 (方案 §4.3)."""
     return (torch.linalg.vector_norm(q.float(), dim=-1) - 1).abs().max()
@@ -162,6 +245,7 @@ class VCGGeometry(nn.Module):
         eps=1e-8,
         renormalize=False,
         blocks=(),
+        tau_ms=None,
     ):
         super().__init__()
         if feature not in FEATURES:
@@ -189,6 +273,10 @@ class VCGGeometry(nn.Module):
         # Explicit configuration: re-normalization is never applied silently (方案 §4.3).
         self.renormalize = renormalize
         self.lags = tuple(lag_samples(ms, sampling_rate) for ms in scales_ms)
+        # tau is the evolution step of the rotation blocks. Fixed to the angular lag by
+        # default; the plan forbids searching it alongside delta and the receptive field.
+        self.tau_ms = tau_ms if tau_ms is not None else (scales_ms[0] if scales_ms else None)
+        self.tau = lag_samples(self.tau_ms, sampling_rate) if self.tau_ms else None
         self.register_buffer("kors", torch.tensor(KORS, dtype=torch.float32))
         scale = torch.ones(3) if vcg_scale is None else torch.tensor(vcg_scale, dtype=torch.float32)
         self.register_buffer("vcg_scale", scale.view(1, 3, 1))
@@ -201,7 +289,15 @@ class VCGGeometry(nn.Module):
             "radial_scale", scale.square().sum().sqrt().view(1, 1, 1), persistent=False
         )
 
-    BLOCK_CHANNELS = {"radial": 1, "direction": 3, "linear": 3, "angular": 4}
+    BLOCK_CHANNELS = {
+        "radial": 1,
+        "direction": 3,
+        "linear": 3,
+        "angular": 4,
+        "rotation": 4,
+        "rotation_delta": 4,
+        "rotation_evolution": 4,
+    }
 
     @property
     def quaternion_channels(self):
@@ -270,6 +366,14 @@ class VCGGeometry(nn.Module):
             elif block == "linear":
                 velocity = linear_velocity(vcg.transpose(1, 2)).transpose(1, 2)
                 parts.append(velocity / self.vcg_scale)
+            elif block == "rotation":
+                parts.append(local_rotation(u, self.lags[0]).transpose(1, 2))
+            elif block == "rotation_delta":
+                q = local_rotation(u, self.lags[0])
+                parts.append(rotation_difference(q, self.tau).transpose(1, 2))
+            elif block == "rotation_evolution":
+                q = local_rotation(u, self.lags[0])
+                parts.append(rotation_evolution(q, self.tau).transpose(1, 2))
             else:
                 # Bit-identical to the M1 input: one quaternion channel is already
                 # [dot, cross_x, cross_y, cross_z] in component-major order.

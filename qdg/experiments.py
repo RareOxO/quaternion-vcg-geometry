@@ -15,7 +15,7 @@ import torch
 
 from .data import CLASSES, load_manifest, save_json
 from .engine import evaluate, setup, train
-from .models import FUSION_PAIRS, SINGLE_VARIANTS, build_model
+from .models import ANGULAR_BLOCKS, FUSION_PAIRS, SINGLE_VARIANTS, build_model
 from .quaternion_nn import receptive_field_samples
 
 # name -> model-config overrides applied on top of the base YAML.
@@ -60,6 +60,18 @@ EXPERIMENTS = {
         "angular_quaternions": 22,
         "branch_width": 32,
     },
+    # Temporal evolution of the angular representation (Temporal evolution 方案 §3).
+    # All three use the SAME plain real temporal encoder; only the angular input changes.
+    **{
+        name: {
+            "variant": "RLAB",
+            "angular_algebra": "standard",
+            "angular_blocks": blocks,
+            "angular_quaternions": 22,
+            "branch_width": 32,
+        }
+        for name, blocks in ANGULAR_BLOCKS.items()
+    },
 }
 MAIN = ("M0", "M1", "M2", "M3", "M4")
 # v2 指导书 §8: M0 and M1 are existing anchors, never retrained for this stage.
@@ -97,6 +109,19 @@ TEMPORAL_DIFFS = (
 # separable angular encoder, so it does not meet the §6 reuse condition.
 ANGULAR = (("RLA-Standard", "RLA_standard"), ("RLA-Quaternion", "RLA_quaternion"))
 ANGULAR_NEW = ("RLA_standard", "RLA_quaternion")
+
+# Temporal evolution 方案 §3. A1 vs A2 is the question; A0 is the local-only floor.
+EVOLUTION = (
+    ("A0 Local only", "A0", "q_t"),
+    ("A1 Real evolution", "A1", "q_t + (q_{t+tau} - q_t)"),
+    ("A2 Quaternion evolution", "A2", "q_t + (q_t^-1 (x) q_{t+tau})"),
+)
+EVOLUTION_NEW = tuple(name for _, name, _ in EVOLUTION)
+EVOLUTION_DIFFS = (
+    ("A2 - A1", "A2", "A1", "Quaternion-specific rotation composition vs plain difference"),
+    ("A1 - A0", "A1", "A0", "Does temporal evolution add anything over local state?"),
+    ("A2 - A0", "A2", "A0", "Total gain of quaternion evolution over local state"),
+)
 
 FUSION = ("M0", "M0_wide", "F1", "F2", "F3", "F4")
 # 双分支方案 §12: train M0 / M0_wide / F1 first and stop for a decision on F1.
@@ -361,6 +386,7 @@ def tables(root):
     diagnostic_tables(root, summary)
     temporal_tables(root, summary, encoder_stats(root))
     angular_tables(root, summary, angular_stats(root))
+    evolution_tables(root, summary, angular_stats(root))
     return summary
 
 
@@ -799,3 +825,119 @@ def angular_stats(root):
             "receptive_field_ms": round(1000 * samples / rate),
         }
     return stats
+
+
+def evolution_tables(root, summary, angular=None):
+    """Tables of the Temporal evolution 方案 §3/§6, written to evolution_tables.md."""
+    root = Path(root)
+    if not any(name in summary for name in EVOLUTION_NEW):
+        return None
+    angular = angular or {}
+    main = _table(
+        ["Model", "Angular input", "Angular Params", "Total Params", "Macro AUROC", *CLASSES],
+        [
+            [
+                label,
+                formula,
+                f"{angular.get(name, {}).get('angular_parameters', 0):,}"
+                if angular.get(name, {}).get("angular_parameters")
+                else "?",
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+            for label, name, formula in EVOLUTION
+            if name in summary
+        ],
+    )
+    gap = {
+        label: summary[new]["macro_auroc_mean"] - summary[old]["macro_auroc_mean"]
+        for label, new, old, _ in EVOLUTION_DIFFS
+        if new in summary and old in summary
+    }
+    diffs = _table(
+        ["Comparison", "Question", "Delta Macro AUROC"],
+        [
+            [label, question, f"{gap[label]:+.4f}"]
+            for label, new, old, question in EVOLUTION_DIFFS
+            if label in gap
+        ],
+    )
+    per_class = ""
+    if "A2" in summary and "A1" in summary:
+        per_class = _table(
+            ["Class", "A2 - A1"],
+            [
+                [cls, f"{summary['A2'][f'{cls}_mean'] - summary['A1'][f'{cls}_mean']:+.4f}"]
+                for cls in CLASSES
+            ],
+        )
+    verdict = interpret_evolution(gap)
+    text = (
+        "# Quaternion temporal evolution of the angular representation\n\n"
+        "q_t = Rotation(u_t -> u_{t+delta}) is a standard HALF-angle rotation quaternion,\n"
+        "not the full-angle [dot, cross] descriptor used by M1-M4. A1 and A2 take the\n"
+        "same two operands and differ only in how they are combined: subtraction in R^4\n"
+        "versus composition in the rotation group. e_t = q_t^-1 (x) q_{t+tau} is a real\n"
+        "relative rotation expressed in q_t's own frame; q_{t+tau} - q_t is a\n"
+        "coordinate-wise difference with no rotation-group meaning.\n\n"
+        "Every variant uses the same plain real temporal encoder, the same R and L\n"
+        "branches, fusion, head, receptive field and recipe. No QuaternionConv is used\n"
+        f"anywhere in this round. Seed 42 only, noise band {NOISE_BAND:.4f}.\n\n"
+        "## Table 15: Angular temporal evolution results\n\n" + main + "\n\n"
+        "## Table 16: Component differences\n\n"
+        + diffs
+        + "\n\n"
+        + ("## Table 17: Per-class A2 - A1\n\n" + per_class + "\n\n" if per_class else "")
+        + "## Verdict\n\n"
+        + verdict
+        + "\n"
+    )
+    missing = [name for _, name, _ in EVOLUTION if name not in summary]
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "evolution_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_evolution(gap):
+    """The §6 decision table, plus what A0 says about evolution itself."""
+    quaternion, evolution = gap.get("A2 - A1"), gap.get("A1 - A0")
+    if quaternion is None:
+        return "**Incomplete.** Train A0, A1 and A2 before reading a verdict."
+    band = NOISE_BAND
+    if quaternion > band:
+        verdict = (
+            f"**Quaternion evolution shows a positive signal.** A2 - A1 is {quaternion:+.4f}, "
+            f"above the {band:.3f} band, so the gain is not merely from adding a temporal "
+            "difference: rotation-group composition carries something the plain difference "
+            "does not.\n\nNext: add seeds 43/44, then run the cardiac-cycle interpretability "
+            "analysis of the plan's section 7. No method claim before both."
+        )
+    elif quaternion < -band:
+        verdict = (
+            f"**Quaternion evolution is behind.** A2 - A1 is {quaternion:+.4f}, below "
+            f"-{band:.3f}.\n\nNext: stop this quaternion representation line."
+        )
+    else:
+        verdict = (
+            f"**Quaternion-specific value is indistinguishable.** A2 - A1 is "
+            f"{quaternion:+.4f}, inside the {band:.3f} band, so composition in the "
+            "rotation group cannot be told apart from a plain temporal difference at "
+            "seed 42.\n\nNext: do not package quaternion representation as a necessary "
+            "component; do not stack further quaternion architecture."
+        )
+    if evolution is not None:
+        if evolution > band:
+            verdict += (
+                f"\n\nSeparately, A1 - A0 is {evolution:+.4f}: angular temporal evolution "
+                "itself does add information over the local angular state, independent of "
+                "how that evolution is encoded."
+            )
+        else:
+            verdict += (
+                f"\n\nSeparately, A1 - A0 is {evolution:+.4f}, inside the band, so at seed "
+                "42 even plain angular evolution is not distinguishable from local state."
+            )
+    return verdict
