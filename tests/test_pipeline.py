@@ -124,3 +124,31 @@ def test_duplicate_seed_error_names_the_directories(synthetic_cache):
         tables(root)
     assert "M0_seed42_20260101T000000Z" in str(error.value)
     assert "seed 42" in str(error.value)
+
+
+def test_results_csv_handles_rows_with_different_fields(synthetic_cache, tmp_path):
+    """Experiment 5's classical arms carry fields a neural run does not.
+
+    The header used to come from the first row alone, so a later row with more fields
+    aborted the whole table generation.
+    """
+    import csv
+
+    from qdg.experiments import tables
+
+    config = synthetic_cache[0]
+    root = Path(config["training"]["output"])
+    evaluate(train(experiment_config(config, "M0"), run_name="M0_seed42") / "best.pt")
+    # A classical-style run directory: same layout, extra keys.
+    extra = root / "E5_stat_seed42"
+    extra.mkdir(parents=True)
+    neural = json.loads((root / "M0_seed42" / "best_test_metrics.json").read_text())
+    (extra / "config.json").write_text((root / "M0_seed42" / "config.json").read_text())
+    (extra / "best_test_metrics.json").write_text(
+        json.dumps({**neural, "classifier_parameters": 900, "frozen_parameters": 62617})
+    )
+    tables(root)
+    with (root / "results.csv").open(encoding="utf-8") as handle:
+        header = next(csv.reader(handle))
+    assert {"classifier_parameters", "frozen_parameters"} <= set(header)
+    assert "macro_auroc_mean" in header

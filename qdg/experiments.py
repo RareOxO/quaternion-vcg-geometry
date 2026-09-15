@@ -661,8 +661,12 @@ def tables(root):
     (root / "tables.md").write_text(text, encoding="utf-8")
     save_json(root / "results.json", summary)
     rows = [{"experiment": name, **row} for name, row in sorted(summary.items())]
+    # Union of every row's keys, in first-seen order: the classical arms of Experiment 5
+    # carry fields a neural run does not, and taking the header from the first row alone
+    # fails as soon as a later row has more.
+    fields = list(dict.fromkeys(key for row in rows for key in row))
     with (root / "results.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=fields, restval="")
         writer.writeheader()
         writer.writerows(rows)
     print(text, flush=True)
