@@ -19,6 +19,29 @@ from .engine import evaluate, setup, train
 from .models import ANGULAR_BLOCKS, FUSION_PAIRS, SINGLE_VARIANTS, build_model
 from .quaternion_nn import receptive_field_samples
 
+# E* frozen for every later experiment (plan section 2.2). This constant is what the
+# later registries build against; `select_encoder` independently recomputes the
+# pre-specified rule from the runs, so the two can be compared.
+SELECTED_ENCODER = "lstm_attention"
+# The pre-specified rule (validation Macro AUROC, then AUPRC, then fewer parameters)
+# ranked QGNN first at 0.9146 against LSTM + Attention at 0.9117. E* was set by hand
+# instead, and that deviation has to travel with the results rather than sit in a commit
+# message: the benchmark table prints this note whenever E* is not the rule's top pick.
+SELECTION_NOTE = (
+    "E* was set by hand rather than taken from the pre-specified rule. The rule's top "
+    "pick led the chosen encoder by 0.0029 validation Macro AUROC, inside the 0.005 "
+    "screening band and below the spread of a benchmark run across three different "
+    "GPUs, so the ranking at the top is not established; the chosen encoder is generic "
+    "and holds a third of the parameters. This is a deviation and must be reported as "
+    "one: a clean selection needs Experiment 1 rerun on one machine with several seeds."
+)
+# Experiment 3 keeps R, L and the operator fixed and varies only the angular
+# representation. A quaternion E* cannot take the 3-vector U at all, so it would force a
+# generic operator here; a generic E* needs no such deviation and lets the Q row reuse
+# the factorial's R+L+Q run.
+REPRESENTATION_ENCODER = QUATERNION_PAIR.get(SELECTED_ENCODER, SELECTED_ENCODER)
+REPRESENTATION_REUSES_FACTORIAL = REPRESENTATION_ENCODER == SELECTED_ENCODER
+
 # name -> model-config overrides applied on top of the base YAML.
 EXPERIMENTS = {
     "M0": {"variant": "M0"},
@@ -73,6 +96,49 @@ EXPERIMENTS = {
             "branch_width": 32,
         }
         for name in ENCODERS
+    },
+    # Experiment 2: the 2^3-1 R/L/Q factorial plus a raw XYZ reference, on the frozen
+    # E*. Experiment 3: the same R + L + <angular> model with the angular representation
+    # swapped for absolute direction (U) or the full-angle descriptor (D); R+L+Q is
+    # E2_RLQ and is never retrained.
+    **{
+        f"E2_{name}": {
+            "variant": "RLAB",
+            "encoder": SELECTED_ENCODER,
+            "angular_algebra": "standard",
+            "angular_blocks": ["rotation"],
+            "angular_quaternions": 22,
+            "branch_width": 32,
+            "branches": branches,
+        }
+        for name, branches in {
+            "R": ["radial"],
+            "L": ["linear"],
+            "Q": ["angular"],
+            "RL": ["radial", "linear"],
+            "RQ": ["radial", "angular"],
+            "LQ": ["linear", "angular"],
+            "RLQ": ["radial", "linear", "angular"],
+            "raw": ["raw"],
+        }.items()
+    },
+    # Experiment 3 uses the GENERIC counterpart of E* on the angular branch, for all
+    # three representations. The absolute direction U is a 3-vector and cannot enter a
+    # quaternion operator at all, and the plan forbids padding a branch merely to fit
+    # one (section 2.1). Holding the operator generic across U, D and Q is what makes
+    # "only the angular representation changes" literally true.
+    **{
+        f"E3_{name}": {
+            "variant": "RLAB",
+            "encoder": REPRESENTATION_ENCODER,
+            "angular_algebra": "standard",
+            "angular_blocks": [block],
+            "angular_quaternions": 22,
+            "branch_width": 32,
+            "branches": ["radial", "linear", "angular"],
+        }
+        for name, block in (("U", "direction"), ("D", "angular"), ("Q", "rotation"))
+        if not (name == "Q" and REPRESENTATION_REUSES_FACTORIAL)
     },
     # Temporal evolution of the angular representation (Temporal evolution 方案 §3).
     # All three use the SAME plain real temporal encoder; only the angular input changes.
@@ -139,6 +205,49 @@ BENCHMARK_LABELS = {
     "qtransformer": "Q-Transformer",
     "qgnn": "QGNN",
 }
+
+# Experiment 2 (plan section 3): conditional contributions come from the differences
+# RLQ - RL, RLQ - RQ and RLQ - LQ, which is why the full factorial is run.
+FACTORIAL = ("E2_R", "E2_L", "E2_Q", "E2_RL", "E2_RQ", "E2_LQ", "E2_RLQ")
+FACTORIAL_REFERENCE = "E2_raw"
+FACTORIAL_LABELS = {
+    "E2_R": "R",
+    "E2_L": "L",
+    "E2_Q": "Q",
+    "E2_RL": "R+L",
+    "E2_RQ": "R+Q",
+    "E2_LQ": "L+Q",
+    "E2_RLQ": "R+L+Q",
+    "E2_raw": "Raw XYZ (reference)",
+}
+FACTORIAL_CONTRIBUTIONS = (
+    ("Q", "E2_RLQ", "E2_RL", "rotational dynamics on top of R+L"),
+    ("L", "E2_RLQ", "E2_RQ", "linear motion on top of R+Q"),
+    ("R", "E2_RLQ", "E2_LQ", "magnitude on top of L+Q"),
+)
+
+# Experiment 3 (plan section 4): R and L, E*, budget and protocol frozen; only the
+# angular representation changes. R+L+Q is E2_RLQ, reused rather than retrained.
+# Names Experiment 3 has to train. The Q row is the factorial's R+L+Q whenever E* is
+# generic, so it is reused rather than retrained.
+REPRESENTATION_NEW = (
+    ("E3_U", "E3_D")
+    if REPRESENTATION_REUSES_FACTORIAL
+    else (
+        "E3_U",
+        "E3_D",
+        "E3_Q",
+    )
+)
+REPRESENTATIONS = (
+    ("R+L+U  absolute unit direction", "E3_U", "u_t"),
+    ("R+L+D  full-angle dot/cross", "E3_D", "[cos t, n sin t]"),
+    (
+        "R+L+Q  rotation quaternion",
+        "E2_RLQ" if REPRESENTATION_REUSES_FACTORIAL else "E3_Q",
+        "[cos(t/2), n sin(t/2)]",
+    ),
+)
 
 # Angular representation 指导书 §2. Both runs already exist: the baseline is the
 # full-angle control of the operator round, and the new variant is the registry's A0,
@@ -430,6 +539,8 @@ def tables(root):
     evolution_tables(root, summary, angular_stats(root))
     representation_tables(root, summary, angular_stats(root))
     benchmark_tables(root, summary, angular_stats(root))
+    factorial_tables(root, summary)
+    representation_ablation_tables(root, summary)
     return summary
 
 
@@ -1150,8 +1261,12 @@ def benchmark_tables(root, summary, encoders=None):
         "smaller parameter count. Test metrics below are reported, never used to select.\n\n"
         "## Table E1.1: Encoder benchmark\n\n" + main + "\n\n"
         "## Table E1.2: Quaternion vs its matched generic encoder\n\n" + pairs + "\n\n"
-        f"## Selected encoder\n\n**E\\* = {best}**\n"
+        f"## Selected encoder\n\n"
+        f"**E\\* = {BENCHMARK_LABELS[SELECTED_ENCODER]}** (frozen for Experiments 2-7)\n\n"
+        f"Pre-specified rule would select: **{best}**\n"
     )
+    if best != BENCHMARK_LABELS.get(SELECTED_ENCODER) and "not selected" not in best:
+        text += f"\n> {SELECTION_NOTE}\n"
     if missing:
         text += f"\nNot yet trained: {', '.join(missing)}\n"
     (root / "benchmark_tables.md").write_text(text, encoding="utf-8")
@@ -1178,3 +1293,117 @@ def select_encoder(summary):
     if any("validation_macro_auroc_mean" not in summary[name] for name in present):
         return "not selected: validation metrics missing from the run summaries"
     return BENCHMARK_LABELS[min(present, key=key)[len("E1_") :]]
+
+
+def factorial_tables(root, summary):
+    """Experiment 2: the R/L/Q factorial and the conditional contributions (plan §3)."""
+    root = Path(root)
+    present = [name for name in (*FACTORIAL, FACTORIAL_REFERENCE) if name in summary]
+    if not present:
+        return None
+    marks = {"E2_raw": ("-", "-", "-")}
+    for name in FACTORIAL:
+        short = name[len("E2_") :]
+        marks[name] = tuple("v" if letter in short else "x" for letter in "RLQ")
+    main = _table(
+        ["Variant", "R", "L", "Q", "Params", "Macro AUROC", "Macro AUPRC", *CLASSES],
+        [
+            [
+                FACTORIAL_LABELS[name],
+                *marks[name],
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                _cell(summary[name], "macro_auprc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+            for name in present
+        ],
+    )
+    contributions = _table(
+        ["Component", "Difference", "Meaning", "Delta Macro AUROC"],
+        [
+            [
+                letter,
+                f"{FACTORIAL_LABELS[full]} - {FACTORIAL_LABELS[without]}",
+                meaning,
+                f"{summary[full]['macro_auroc_mean'] - summary[without]['macro_auroc_mean']:+.4f}",
+            ]
+            for letter, full, without, meaning in FACTORIAL_CONTRIBUTIONS
+            if full in summary and without in summary
+        ],
+    )
+    missing = [name for name in (*FACTORIAL, FACTORIAL_REFERENCE) if name not in summary]
+    text = (
+        "# Experiment 2: R/L/Q component ablation\n\n"
+        f"Full 2^3-1 factorial on the frozen E* = {BENCHMARK_LABELS[SELECTED_ENCODER]}, plus a\n"
+        "raw XYZ reference that is NOT part of the factorial design. A conditional\n"
+        "contribution is the difference between the full model and the model without that\n"
+        f"component. Seed 42, screening band {NOISE_BAND:.4f}.\n\n"
+        "## Table E2.1: Factorial results\n\n" + main + "\n\n"
+        "## Table E2.2: Conditional contributions\n\n" + contributions + "\n"
+    )
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "factorial_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def representation_ablation_tables(root, summary):
+    """Experiment 3: R and L fixed, only the angular representation changes (plan §4)."""
+    root = Path(root)
+    present = [
+        (label, name, formula) for label, name, formula in REPRESENTATIONS if name in summary
+    ]
+    if not present:
+        return None
+    main = _table(
+        ["Variant", "Angular representation", "Params", "Macro AUROC", "Macro AUPRC", *CLASSES],
+        [
+            [
+                label,
+                formula,
+                f"{summary[name]['parameters']:,}",
+                _cell(summary[name], "macro_auroc"),
+                _cell(summary[name], "macro_auprc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+            for label, name, formula in present
+        ],
+    )
+    pairs = _table(
+        ["Comparison", "Question", "Delta Macro AUROC"],
+        [
+            [
+                label,
+                question,
+                f"{summary[new]['macro_auroc_mean'] - summary[old]['macro_auroc_mean']:+.4f}",
+            ]
+            for label, new, old, question in (
+                ("D - U", "E3_D", "E3_U", "Local angular dynamics vs absolute direction"),
+                ("Q - D", "E3_Q", "E3_D", "Half-angle rotation vs full-angle descriptor"),
+                ("Q - U", "E3_Q", "E3_U", "Rotation parameterization vs absolute direction"),
+            )
+            if new in summary and old in summary
+        ],
+    )
+    missing = [name for _, name, _ in REPRESENTATIONS if name not in summary]
+    text = (
+        "# Experiment 3: angular representation ablation\n\n"
+        "R, L, receptive field, channel and parameter budget, fusion, head and training\n"
+        "protocol are frozen; only the angular representation changes. All three use the\n"
+        f"generic counterpart of E* ({BENCHMARK_LABELS[REPRESENTATION_ENCODER]}) on the angular\n"
+        "branch: U is a 3-vector and cannot enter a quaternion operator, and padding a\n"
+        "branch to fit one is forbidden, so holding the operator generic is what makes\n"
+        "'only the representation changes' literally true.\n\n"
+        "D and Q derive from the same (theta, n); neither carries more raw information\n"
+        "than the other, and the comparison is about parameterization and empirical\n"
+        f"utility only. Seed 42, screening band {NOISE_BAND:.4f}.\n\n"
+        "## Table E3.1: Representation results\n\n" + main + "\n\n"
+        "## Table E3.2: Pairwise differences\n\n" + pairs + "\n"
+    )
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "representation_ablation_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text

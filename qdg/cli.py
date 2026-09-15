@@ -8,6 +8,9 @@ from .engine import evaluate, train
 from .experiments import (
     ANGULAR_NEW,
     BENCHMARK,
+    FACTORIAL,
+    FACTORIAL_REFERENCE,
+    REPRESENTATION_NEW,
     DIAGNOSTIC_NEW,
     EVOLUTION_NEW,
     EXPERIMENTS,
@@ -67,10 +70,13 @@ def main():
                     "angular",
                     "evolution",
                     "benchmark",
+                    "factorial",
+                    "representation",
                 ),
-                help="stage-a: M0, M0_wide, F1; fusion: the F ladder; "
-                "diagnostic: R, RA, RU, RLA; temporal: RLA_short and RLA_medium "
-                "(anchors M0/M1/RLA are reused, never retrained)",
+                help="benchmark: the ten Exp 1 encoders; factorial: the Exp 2 R/L/Q "
+                "factorial plus the raw XYZ reference; representation: Exp 3 U/D/Q. "
+                "Earlier stages: stage-a, fusion, diagnostic, temporal, angular, "
+                "evolution. Anchors already trained are reused, never retrained.",
             )
             sub.add_argument("--seeds", nargs="+", type=int, default=[42])
     evaluation = subparsers.add_parser("evaluate")
@@ -119,6 +125,8 @@ def main():
                 "angular": list(ANGULAR_NEW),
                 "evolution": list(EVOLUTION_NEW),
                 "benchmark": list(BENCHMARK),
+                "factorial": [*FACTORIAL, FACTORIAL_REFERENCE],
+                "representation": list(REPRESENTATION_NEW),
             }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)

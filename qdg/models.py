@@ -237,6 +237,9 @@ def build_model(config, stats):
 
 
 BRANCH_BLOCKS = ("radial", "linear", "angular")
+# Experiment 2 runs the 2^3-1 factorial over these, plus a raw XYZ reference that is a
+# single branch carrying the unnormalized cardiac vector.
+ALL_BRANCHES = ("raw", *BRANCH_BLOCKS)
 # Angular representations of the Temporal evolution 方案 §3. A1 and A2 share operands
 # and differ only in how the two local rotations are combined: subtraction in R^4
 # versus composition in the rotation group.
@@ -278,7 +281,19 @@ class BranchedRLANet(nn.Module):
         # 4Q for the quaternion encoder, 2Q for the standard one: a quaternion conv holds
         # 4*Q^2*K weights and a real conv of width W holds W^2*K, so W = 2Q equalizes them.
         angular_width = 4 * quaternions if algebra == "quaternion" else 2 * quaternions
-        angular_blocks = config.get("angular_blocks") or ["angular"]
+        # `or` would turn an explicitly empty list into the default, silently building
+        # a different model than the config asked for; absent and empty must differ.
+        angular_blocks = config.get("angular_blocks")
+        angular_blocks = ["angular"] if angular_blocks is None else list(angular_blocks)
+        branches = config.get("branches")
+        branches = tuple(BRANCH_BLOCKS if branches is None else branches)
+        if not branches or len(set(branches)) != len(branches):
+            raise ValueError("model.branches must be a non-empty set of unique names")
+        if any(branch not in ALL_BRANCHES for branch in branches):
+            raise ValueError(f"model.branches must be drawn from {ALL_BRANCHES}")
+        if "raw" in branches and len(branches) > 1:
+            raise ValueError("The raw XYZ reference is a single-branch control")
+        self.branches = branches
         branch_blocks = {
             "radial": ["radial"],
             "linear": ["linear"],
@@ -286,15 +301,15 @@ class BranchedRLANet(nn.Module):
         }
         self.frontends = nn.ModuleDict(
             {
-                block: VCGGeometry(
-                    "composite",
-                    config.get("scales_ms") or [20],
+                branch: VCGGeometry(
+                    "raw" if branch == "raw" else "composite",
+                    [] if branch == "raw" else (config.get("scales_ms") or [20]),
                     stats["sampling_rate"],
                     vcg_scale=stats["vcg_std"],
-                    blocks=branch_blocks[block],
-                    tau_ms=config.get("tau_ms"),
+                    blocks=() if branch == "raw" else branch_blocks[branch],
+                    tau_ms=None if branch == "raw" else config.get("tau_ms"),
                 )
-                for block in BRANCH_BLOCKS
+                for branch in branches
             }
         )
         shared = {
@@ -312,36 +327,37 @@ class BranchedRLANet(nn.Module):
             body = {k: v for k, v in shared.items() if k != "stem_stride"}
             self.encoders = nn.ModuleDict(
                 {
-                    block: build_encoder(
-                        branch_encoder(encoder, block),
-                        self.frontends[block].out_channels,
-                        angular_width if block == "angular" else branch_width,
+                    branch: build_encoder(
+                        branch_encoder(encoder, branch),
+                        self.frontends[branch].out_channels,
+                        angular_width if branch == "angular" else branch_width,
                         **body,
                     )
-                    for block in BRANCH_BLOCKS
+                    for branch in branches
                 }
             )
         else:
             self.encoders = nn.ModuleDict(
                 {
-                    block: TCNEncoder(
-                        self.frontends[block].out_channels,
-                        angular_width if block == "angular" else branch_width,
-                        quaternion=(block == "angular" and algebra == "quaternion"),
+                    branch: TCNEncoder(
+                        self.frontends[branch].out_channels,
+                        angular_width if branch == "angular" else branch_width,
+                        quaternion=(branch == "angular" and algebra == "quaternion"),
                         **shared,
                     )
-                    for block in BRANCH_BLOCKS
+                    for branch in branches
                 }
             )
         dim = config.get("fusion_dim") or branch_width
         self.projections = nn.ModuleDict(
-            {block: nn.Linear(self.encoders[block].width, dim) for block in BRANCH_BLOCKS}
+            {branch: nn.Linear(self.encoders[branch].width, dim) for branch in branches}
         )
-        self.norm = nn.LayerNorm(len(BRANCH_BLOCKS) * dim)
-        self.head = nn.Linear(len(BRANCH_BLOCKS) * dim, len(CLASSES))
+        self.norm = nn.LayerNorm(len(branches) * dim)
+        self.head = nn.Linear(len(branches) * dim, len(CLASSES))
         self.settings = {
+            "branches": list(branches),
             "encoder": encoder,
-            "branch_encoders": {b: branch_encoder(encoder, b) for b in BRANCH_BLOCKS}
+            "branch_encoders": {b: branch_encoder(encoder, b) for b in branches}
             if encoder
             else None,
             "angular_algebra": algebra,
@@ -350,12 +366,14 @@ class BranchedRLANet(nn.Module):
             "branch_width": branch_width,
             "fusion_dim": dim,
             "angular_blocks": list(angular_blocks),
-            "tau_ms": self.frontends["angular"].tau_ms,
+            "tau_ms": self.frontends["angular"].tau_ms if "angular" in self.frontends else None,
             "scales_ms": list(config.get("scales_ms") or [20]),
             **shared,
         }
 
     def angular_parameters(self):
+        if "angular" not in self.encoders:
+            return 0
         return sum(p.numel() for p in self.encoders["angular"].parameters())
 
     def describe(self):
@@ -366,8 +384,9 @@ class BranchedRLANet(nn.Module):
         if len(defined) > 1:
             raise ValueError(f"Branch receptive fields must match, got {fields}")
         return {
+            "branches": list(self.branches),
             "encoder_parameters": sum(p.numel() for p in self.encoders.parameters()),
-            "receptive_field_samples": fields["angular"],
+            "receptive_field_samples": fields.get("angular", next(iter(fields.values()))),
             "input_channels": {
                 block: frontend.out_channels for block, frontend in self.frontends.items()
             },
@@ -380,8 +399,8 @@ class BranchedRLANet(nn.Module):
 
     def forward_features(self, ecg):
         parts = [
-            self.projections[block](self.encoders[block](self.frontends[block](ecg)).float())
-            for block in BRANCH_BLOCKS
+            self.projections[branch](self.encoders[branch](self.frontends[branch](ecg)).float())
+            for branch in self.branches
         ]
         return self.norm(torch.cat(parts, dim=-1))
 
