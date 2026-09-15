@@ -815,7 +815,7 @@ def interpret(gap):
         )
     return (
         "partially supported",
-        "The differences do not match a single pattern in the decision table cleanly.",
+        "The differences do not match any single row of the decision table cleanly.",
         "Inspect the per-class table before committing to a second stage.",
     )
 

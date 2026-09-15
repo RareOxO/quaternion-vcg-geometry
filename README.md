@@ -245,6 +245,52 @@ python -m qdg train --experiment E1_qlstm            # or one at a time
 
 Results go to `runs/benchmark_tables.md`.
 
+## Interpretability: R-peak-relative and cardiac-phase-resolved
+
+Two stages, no retraining. `qdg interpret` removes the information in one branch inside
+one window of R-peak-relative time and records the signed logit change,
+`C = z - z_perturbed`; R and L are replaced by a linear interpolation between the window
+boundaries, Q by a SLERP along the geodesic, and replacing Q with the identity rotation
+is the robustness arm. Each run now also writes `attribution_records_<mode>.npz`, the
+per-record tensor, so the second stage never repeats the forward pass.
+
+`qdg phases` delineates every beat of every analysed record -- QRS onset, R peak, QRS
+offset, T peak, T end, from the spatial magnitude and velocity of the cardiac vector,
+which are functions of all eight independent leads -- and carries those same
+contributions onto each patient's own intervals:
+
+    DEP = [QRS_on, QRS_off]        REP = (QRS_off, T_end]
+
+A perturbation window is split between the phases by the fraction of its duration on
+each side of the boundary, never assigned whole to the phase its centre falls in. The Q
+windows carry a +10 ms shift, because `q_t` spans `[t, t + 20 ms]` and its physiological
+instant is the midpoint. Boundaries that violate the temporal ordering or leave a
+physiological duration range are flagged, never moved, and a beat with a reliable QRS
+but an unreliable T wave still enters DEP while being excluded from REP. Phases are
+compared on contribution *density*, because DEP is short and REP is long; mass and
+signed density are written alongside it. Everything aggregates beat to record to patient
+to disease, and the bootstrap resamples patients.
+
+```bash
+CKPT=runs/E2_RLQ_seed42/best.pt
+python -m qdg interpret --checkpoint $CKPT --window-ms 20 --output runs/interpretability/w20
+python -m qdg interpret --checkpoint $CKPT --window-ms 20 --quaternion-mode identity \
+    --output runs/interpretability/w20_identity
+python -m qdg interpret --checkpoint $CKPT --window-ms 10 --output runs/interpretability/w10
+python -m qdg interpret --checkpoint $CKPT --window-ms 40 --output runs/interpretability/w40
+python -m qdg phases --root runs/interpretability --output runs/phases
+```
+
+`phases` reads every `attribution_records_*.npz` under `--root`, takes the 20 ms SLERP
+run as primary, and writes the delineation QC before any phase-level number:
+`beat_boundaries.csv`, `delineation_qc.csv`, `phase_contribution_patient.csv`,
+`phase_contribution_disease_summary.csv`, `phase_branch_share.csv`,
+`phase_robustness_window.csv`, `phase_robustness_q_perturbation.csv`,
+`phase_stability.csv`, and four figures as both `.png` and `.pdf`. The main figure is
+Panel A, the R-peak-relative heatmap on one symmetric scale clipped at the 99th
+percentile; Panel B, DEP against REP density per disease and branch with patient
+bootstrap intervals; Panel C, the R/L/Q composition inside each phase.
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five
@@ -292,4 +338,7 @@ qdg/data.py           PTB-XL cache and dataset
 qdg/engine.py         training and evaluation
 qdg/experiments.py    experiment registry and table generation
 qdg/sanity.py         §6 checks and the numerical norm report
+qdg/interpret.py      perturbation contributions on R-peak-relative time
+qdg/delineate.py      per-beat QRS onset/offset and T peak/end, with QC flags
+qdg/phases.py         contributions mapped onto DEP and REP, tables and the main figure
 ```

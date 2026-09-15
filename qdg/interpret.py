@@ -47,6 +47,12 @@ RELATIVE_MS = (-300, 600)
 STRIDE_MS = 10
 WINDOW_MS = 20
 IDENTITY = (1.0, 0.0, 0.0, 0.0)
+# The colour scale of the figure saturates here. Fixed in advance rather than chosen
+# after looking at the result: one cell -- HYP's R branch at the R peak -- is several
+# times larger than anything else, and a scale set by the maximum leaves the other
+# eleven rows unreadably pale. One symmetric scale is shared by every panel and every
+# branch, so Q is never given a scale of its own.
+CLIP_QUANTILE = 0.99
 
 
 def relative_times(stride_ms=STRIDE_MS):
@@ -201,6 +207,11 @@ def contributions(
         "contributions": scores,
         "labels": labels,
         "patients": record_patients,
+        "ecg_ids": dataset.ecg_ids[dataset.indices][keep],
+        "cache_rows": dataset.indices[keep],
+        "peaks": [peaks[r] for r in keep],
+        "sampling_rate": int(rate),
+        "signal_length": int(ecg.shape[-1]),
         "times_ms": times,
         "window_ms": window_ms,
         "stride_ms": stride_ms,
@@ -251,7 +262,7 @@ def heatmap(panels, times, path, title=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    limit = float(np.abs(panels).max()) or 1.0
+    limit = float(np.quantile(np.abs(panels), CLIP_QUANTILE)) or 1.0
     figure, axes = plt.subplots(len(DISEASES), 1, figsize=(9, 7), sharex=True)
     image = None
     for axis, disease, panel in zip(axes, DISEASES, panels):
@@ -269,7 +280,13 @@ def heatmap(panels, times, path, title=None):
         axis.set_ylabel(disease, rotation=0, labelpad=26, va="center", fontweight="bold")
         axis.axvline(0, color="black", linewidth=0.8, linestyle="--")
     axes[-1].set_xlabel("Time relative to R peak (ms)")
-    figure.colorbar(image, ax=axes, label="Contribution  (logit drop when removed)", pad=0.02)
+    figure.colorbar(
+        image,
+        ax=axes,
+        label=f"Contribution, logit drop when removed "
+        f"(clipped at the {int(CLIP_QUANTILE * 100)}th percentile)",
+        pad=0.02,
+    )
     if title:
         figure.suptitle(title)
     figure.savefig(path, dpi=200, bbox_inches="tight")
@@ -288,6 +305,25 @@ def run(config, checkpoint, output=None, **kwargs):
         lower=summary["lower"],
         upper=summary["upper"],
         times_ms=result["times_ms"],
+    )
+    ragged = np.cumsum([0] + [len(found) for found in result["peaks"]])
+    np.savez_compressed(
+        output / f"attribution_records_{result['quaternion_mode']}.npz",
+        contributions=result["contributions"],
+        labels=result["labels"],
+        patients=result["patients"],
+        ecg_ids=result["ecg_ids"],
+        cache_rows=result["cache_rows"],
+        peaks=np.concatenate(result["peaks"]).astype(np.int64)
+        if result["peaks"]
+        else np.zeros(0, dtype=np.int64),
+        peak_offsets=ragged.astype(np.int64),
+        times_ms=result["times_ms"],
+        window_ms=np.int64(result["window_ms"]),
+        stride_ms=np.int64(result["stride_ms"]),
+        sampling_rate=np.int64(result["sampling_rate"]),
+        signal_length=np.int64(result["signal_length"]),
+        quaternion_mode=np.array(result["quaternion_mode"]),
     )
     report = {
         "diseases": list(DISEASES),

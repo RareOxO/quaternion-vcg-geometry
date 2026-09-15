@@ -114,6 +114,16 @@ def main():
         help="SLERP between the boundary rotations, or the identity-rotation robustness check",
     )
     interpretability.add_argument("--limit", type=int)
+    phase = subparsers.add_parser("phases")
+    phase.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    phase.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="directory holding the attribution_records_*.npz written by `qdg interpret`",
+    )
+    phase.add_argument("--output", type=Path)
+    phase.add_argument("--bootstrap", type=int, default=1000)
     evaluation = subparsers.add_parser("evaluate")
     evaluation.add_argument("--checkpoint", required=True, type=Path)
     evaluation.add_argument("--split", choices=("val", "test"), default="test")
@@ -135,6 +145,13 @@ def main():
             stride_ms=args.stride_ms,
             quaternion_mode=args.quaternion_mode,
             limit=args.limit,
+        )
+        return
+    if args.command == "phases":
+        from .phases import run as run_phases
+
+        run_phases(
+            load_config(args.config), args.root, output=args.output, bootstrap=args.bootstrap
         )
         return
     if args.command == "handcrafted":
