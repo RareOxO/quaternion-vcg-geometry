@@ -138,8 +138,10 @@ class Downsample(nn.Module):
 
     stride, poolings = 5, 3
 
-    def __init__(self, in_channels, width, quaternion=False):
+    def __init__(self, in_channels, width, quaternion=False, stride=None, poolings=None):
         super().__init__()
+        self.stride = self.stride if stride is None else stride
+        self.poolings = self.poolings if poolings is None else poolings
         self.quaternion, self.width = quaternion, width
         if quaternion:
             self.stem = QuaternionConv1d(
@@ -162,9 +164,9 @@ class Downsample(nn.Module):
 class _Encoder(nn.Module):
     """Common shape contract: (B, C, T) -> (B, width), with a measured field."""
 
-    def __init__(self, in_channels, width, quaternion=False):
+    def __init__(self, in_channels, width, quaternion=False, stem=None):
         super().__init__()
-        self.down = Downsample(in_channels, width, quaternion)
+        self.down = Downsample(in_channels, width, quaternion, **(stem or {}))
         self.quaternion, self.width = quaternion, width
 
     def receptive_field_of(self, body_layers=()):
@@ -174,8 +176,17 @@ class _Encoder(nn.Module):
 class RecurrentEncoder(_Encoder):
     """LSTM / GRU / QLSTM, optionally with attention pooling instead of a mean."""
 
-    def __init__(self, in_channels, width, kind="lstm", attention=False, dropout=0.1):
-        super().__init__(in_channels, width, quaternion=kind == "qlstm")
+    def __init__(
+        self,
+        in_channels,
+        width,
+        kind="lstm",
+        attention=False,
+        dropout=0.1,
+        stem=None,
+        context_steps=None,
+    ):
+        super().__init__(in_channels, width, quaternion=kind == "qlstm", stem=stem)
         if kind == "qlstm":
             self.rnn = QuaternionLSTM(width // 4, width // 4)
         else:
@@ -184,12 +195,39 @@ class RecurrentEncoder(_Encoder):
         self.kind = kind
         self.pool = AttentionPool(width) if attention else None
         self.dropout = nn.Dropout(dropout)
+        # Accessible temporal context, in downsampled steps. None leaves the recurrence
+        # unrestricted, which is what every experiment other than Experiment 4 uses.
+        self.context_steps = context_steps
         # A recurrent pass sees every earlier step, so the field is the whole input.
         self.receptive_field = None
 
+    def _recur(self, x):
+        return self.rnn(x) if self.kind == "qlstm" else self.rnn(x)[0]
+
+    def _chunked(self, x):
+        """Reset the recurrent state every `context_steps`, so nothing is integrated
+        across a chunk boundary.
+
+        Implemented by folding the chunk axis into the batch: each row then starts from
+        the zero state, which IS the reset, and the whole sweep runs at one matmul per
+        step exactly as the unrestricted model does. The tail is zero-padded to a whole
+        number of chunks and cropped afterwards; because the recurrence is causal,
+        padding placed AFTER a real step cannot reach it, so the padding is inert rather
+        than merely small.
+        """
+        batch, steps, channels = x.shape
+        window = self.context_steps
+        padding = (-steps) % window
+        if padding:
+            x = F.pad(x, (0, 0, 0, padding))
+        folded = x.reshape(batch * (x.shape[1] // window), window, channels)
+        out = self._recur(folded)
+        return out.reshape(batch, -1, out.shape[-1])[:, :steps]
+
     def forward(self, x):
         x = self.down(x).transpose(1, 2)
-        x = self.rnn(x) if self.kind == "qlstm" else self.rnn(x)[0]
+        restricted = self.context_steps and self.context_steps < x.shape[1]
+        x = self._chunked(x) if restricted else self._recur(x)
         x = self.dropout(x)
         return self.pool(x) if self.pool is not None else x.mean(dim=1)
 
@@ -338,10 +376,13 @@ def build_encoder(name, in_channels, width, **shared):
     if name not in ENCODERS:
         raise ValueError(f"encoder must be one of {ENCODERS}")
     dropout = shared.get("dropout", 0.1)
+    recurrent = {"stem": shared.get("stem"), "context_steps": shared.get("context_steps")}
     if name in ("lstm", "gru", "qlstm"):
-        return RecurrentEncoder(in_channels, width, kind=name, dropout=dropout)
+        return RecurrentEncoder(in_channels, width, kind=name, dropout=dropout, **recurrent)
     if name == "lstm_attention":
-        return RecurrentEncoder(in_channels, width, kind="lstm", attention=True, dropout=dropout)
+        return RecurrentEncoder(
+            in_channels, width, kind="lstm", attention=True, dropout=dropout, **recurrent
+        )
     if name in ("tcn", "qtcn", "tcn_attention"):
         return ConvEncoder(
             in_channels,

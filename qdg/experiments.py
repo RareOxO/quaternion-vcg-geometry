@@ -42,6 +42,37 @@ SELECTION_NOTE = (
 REPRESENTATION_ENCODER = QUATERNION_PAIR.get(SELECTED_ENCODER, SELECTED_ENCODER)
 REPRESENTATION_REUSES_FACTORIAL = REPRESENTATION_ENCODER == SELECTED_ENCODER
 
+# Experiment 4: accessible temporal-context ablation (plan section 5, as redefined).
+# A stem of stride 5 with one pooling gives 20 ms per step, which is what puts the
+# shortest level within reach; every level shares it, so the sweep is internally
+# controlled even though this stem is finer than the one Experiments 1-3 use.
+CONTEXT_STEM = {"stride": 5, "poolings": 1}
+CONTEXT_STEP_MS = 20
+# (label, accessible context in ms). None is the unrestricted upper anchor: the same
+# model with no state reset, which says whether 1280 ms has already saturated.
+CONTEXT_LEVELS = (
+    ("20ms", 20),
+    ("40ms", 40),
+    ("80ms", 80),
+    ("160ms", 160),
+    ("320ms", 320),
+    ("640ms", 640),
+    ("1280ms", 1280),
+    ("full", None),
+)
+CONTEXT_SCALE = {
+    20: "local",
+    40: "local",
+    80: "local",
+    160: "phase-scale",
+    320: "phase-scale",
+    640: "cycle-scale",
+    1280: "cycle-scale",
+    None: "unrestricted",
+}
+CONTEXT = tuple(f"E4_{label}" for label, _ in CONTEXT_LEVELS)
+
+
 # name -> model-config overrides applied on top of the base YAML.
 EXPERIMENTS = {
     "M0": {"variant": "M0"},
@@ -139,6 +170,24 @@ EXPERIMENTS = {
         }
         for name, block in (("U", "direction"), ("D", "angular"), ("Q", "rotation"))
         if not (name == "Q" and REPRESENTATION_REUSES_FACTORIAL)
+    },
+    # Experiment 4: accessible temporal-context ablation. E* stays LSTM + Attention and
+    # its architecture is untouched; what changes is how much time the recurrence may
+    # integrate, set by resetting the recurrent state every `context_ms`. A finer stem
+    # than the other experiments use puts the 20 ms floor within reach.
+    **{
+        f"E4_{label}": {
+            "variant": "RLAB",
+            "encoder": SELECTED_ENCODER,
+            "angular_algebra": "standard",
+            "angular_blocks": ["rotation"],
+            "angular_quaternions": 22,
+            "branch_width": 32,
+            "branches": ["radial", "linear", "angular"],
+            "stem": CONTEXT_STEM,
+            "context_ms": context,
+        }
+        for label, context in CONTEXT_LEVELS
     },
     # Temporal evolution of the angular representation (Temporal evolution 方案 §3).
     # All three use the SAME plain real temporal encoder; only the angular input changes.
@@ -541,6 +590,7 @@ def tables(root):
     benchmark_tables(root, summary, angular_stats(root))
     factorial_tables(root, summary)
     representation_ablation_tables(root, summary)
+    context_tables(root, summary)
     return summary
 
 
@@ -1430,3 +1480,119 @@ def representation_ablation_tables(root, summary):
     (root / "representation_ablation_tables.md").write_text(text, encoding="utf-8")
     print(text, flush=True)
     return text
+
+
+def context_tables(root, summary):
+    """Experiment 4: accessible temporal-context ablation (plan section 5, redefined).
+
+    The pre-specified reading is fixed here so it cannot be chosen after seeing the
+    numbers: the trend is read over the ordered levels, and the local / phase-scale /
+    cycle-scale grouping is the one the plan defines, not one fitted to the result.
+    """
+    root = Path(root)
+    present = [(label, context) for label, context in CONTEXT_LEVELS if f"E4_{label}" in summary]
+    if not present:
+        return None
+    main = _table(
+        ["Accessible context", "Scale", "Params", "Macro AUROC", "Macro AUPRC", *CLASSES],
+        [
+            [
+                f"{context} ms" if context else "unrestricted",
+                CONTEXT_SCALE[context],
+                f"{summary[f'E4_{label}']['parameters']:,}",
+                _cell(summary[f"E4_{label}"], "macro_auroc"),
+                _cell(summary[f"E4_{label}"], "macro_auprc"),
+                *[_cell(summary[f"E4_{label}"], cls) for cls in CLASSES],
+            ]
+            for label, context in present
+        ],
+    )
+    scores = {context: summary[f"E4_{label}"]["macro_auroc_mean"] for label, context in present}
+    steps = _table(
+        ["Step", "Delta Macro AUROC"],
+        [
+            [
+                f"{b} ms - {a} ms" if b else f"unrestricted - {a} ms",
+                f"{scores[b] - scores[a]:+.4f}",
+            ]
+            for a, b in zip([c for _, c in present], [c for _, c in present][1:])
+        ],
+    )
+    text = (
+        "# Experiment 4: accessible temporal-context ablation\n\n"
+        f"E* ({BENCHMARK_LABELS[SELECTED_ENCODER]}) is unchanged: same architecture, same\n"
+        "width, same parameter count at every level. What is varied is how much time the\n"
+        "recurrence may integrate, by resetting the recurrent state every N steps so that\n"
+        "nothing crosses a boundary. All three branches carry the same restriction, so\n"
+        "they stay temporally aligned.\n\n"
+        "Assumptions this rests on, stated rather than buried:\n\n"
+        f"1. One step is {CONTEXT_STEP_MS} ms. The stem is stride {CONTEXT_STEM['stride']} with\n"
+        f"   {CONTEXT_STEM['poolings']} pooling, finer than the stem Experiments 1-3 use, which\n"
+        "   is what puts the 20 ms level within reach. Every level shares it, so the sweep\n"
+        "   is internally controlled; its absolute numbers are not directly comparable to\n"
+        "   Experiment 2's.\n"
+        "2. The restriction bounds temporal INTEGRATION, not visibility. A step near the\n"
+        "   end of a chunk sees the full window, one at the start sees less, so N is an\n"
+        "   upper bound rather than a uniform context. The mechanism is identical at every\n"
+        "   level, so the comparison is still controlled.\n"
+        "3. Attention still pools over the whole record. The model may therefore weigh\n"
+        "   local summaries from anywhere in the 10 s, but cannot represent a dependency\n"
+        "   longer than the window. That is the intended meaning of accessible context.\n"
+        "4. The tail is zero-padded to a whole number of chunks and cropped afterwards.\n"
+        "   The recurrence is causal, so padding placed after a real step cannot reach it.\n\n"
+        "## Table E4.1: Context levels\n\n" + main + "\n\n"
+        "## Table E4.2: Step-to-step differences\n\n" + steps + "\n\n"
+        "## Verdict\n\n" + interpret_context(scores) + "\n"
+    )
+    missing = [f"E4_{label}" for label, _ in CONTEXT_LEVELS if f"E4_{label}" not in summary]
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "context_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_context(scores):
+    """Read the sweep against the plan's pre-specified scale grouping."""
+    levels = [context for context in scores if context is not None]
+    if len(levels) < len(CONTEXT_LEVELS) - 1:
+        return "**Incomplete.** Train every context level before reading a trend."
+    band = NOISE_BAND
+    ordered = sorted(levels)
+    best = max(ordered, key=lambda c: scores[c])
+    total = scores[ordered[-1]] - scores[ordered[0]]
+    grouped = {}
+    for context in ordered:
+        grouped.setdefault(CONTEXT_SCALE[context], []).append(scores[context])
+    means = {scale: sum(values) / len(values) for scale, values in grouped.items()}
+    summary = ", ".join(f"{scale} {value:.4f}" for scale, value in means.items())
+    lines = [f"Scale means: {summary}."]
+    if total > band:
+        lines.append(
+            f"**Longer accessible context helps.** Cycle-scale minus local is "
+            f"{total:+.4f}, clear of the {band:.3f} screening band, so the model uses "
+            "information it can only obtain by integrating over a longer window."
+        )
+    elif total < -band:
+        lines.append(
+            f"**Longer accessible context hurts.** The total change is {total:+.4f}; "
+            "restricting integration is better than allowing it here."
+        )
+    else:
+        lines.append(
+            f"**Not supported.** Cycle-scale minus local is {total:+.4f}, inside the "
+            f"{band:.3f} band, so at seed 42 the context levels are indistinguishable."
+        )
+    if best != ordered[-1] and scores[best] - scores[ordered[-1]] > band:
+        lines.append(
+            f"The best level is {best} ms rather than the longest, by "
+            f"{scores[best] - scores[ordered[-1]]:+.4f}, which points to a bounded useful "
+            "range rather than 'longer is better'. Experiment 6 should take its local and "
+            "long settings from this."
+        )
+    if None in scores:
+        lines.append(
+            f"Unrestricted minus 1280 ms is {scores[None] - scores[ordered[-1]]:+.4f}: "
+            "whether the longest tested window already saturates."
+        )
+    return "\n\n".join(lines)

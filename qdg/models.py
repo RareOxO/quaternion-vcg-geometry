@@ -31,7 +31,7 @@ import torch
 from torch import nn
 
 from .data import CLASSES
-from .encoders import branch_encoder, build_encoder, encoder_widths
+from .encoders import Downsample, branch_encoder, build_encoder, encoder_widths
 from .geometry import VCGGeometry
 from .quaternion_nn import TCNEncoder
 
@@ -325,6 +325,25 @@ class BranchedRLANet(nn.Module):
         if encoder:
             angular_width, branch_width = encoder_widths(encoder, 4 * quaternions)
             body = {k: v for k, v in shared.items() if k != "stem_stride"}
+            # Experiment 4 restricts how much time the recurrence may integrate. The
+            # limit is expressed in milliseconds and converted here, because the number
+            # of steps it corresponds to depends on the stem; every branch gets the same
+            # restriction so the branches stay temporally aligned.
+            stem = config.get("stem")
+            factor = (stem or {}).get("stride", Downsample.stride) * 2 ** (
+                (stem or {}).get("poolings", Downsample.poolings)
+            )
+            step_ms = 1000 * factor / stats["sampling_rate"]
+            context_ms = config.get("context_ms")
+            context_steps = None
+            if context_ms is not None:
+                if context_ms % step_ms:
+                    raise ValueError(
+                        f"context_ms {context_ms} is not a whole number of "
+                        f"{step_ms:g} ms stem steps"
+                    )
+                context_steps = int(context_ms / step_ms)
+            body.update(stem=stem, context_steps=context_steps)
             self.encoders = nn.ModuleDict(
                 {
                     branch: build_encoder(
@@ -357,6 +376,8 @@ class BranchedRLANet(nn.Module):
         self.settings = {
             "branches": list(branches),
             "encoder": encoder,
+            "context_ms": config.get("context_ms"),
+            "stem": config.get("stem"),
             "branch_encoders": {b: branch_encoder(encoder, b) for b in branches}
             if encoder
             else None,

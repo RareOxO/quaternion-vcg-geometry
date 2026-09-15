@@ -8,6 +8,7 @@ from .engine import evaluate, train
 from .experiments import (
     ANGULAR_NEW,
     BENCHMARK,
+    CONTEXT,
     FACTORIAL,
     FACTORIAL_REFERENCE,
     REPRESENTATION_NEW,
@@ -72,6 +73,7 @@ def main():
                     "benchmark",
                     "factorial",
                     "representation",
+                    "context",
                 ),
                 help="benchmark: the ten Exp 1 encoders; factorial: the Exp 2 R/L/Q "
                 "factorial plus the raw XYZ reference; representation: Exp 3 U/D/Q. "
@@ -127,6 +129,7 @@ def main():
                 "benchmark": list(BENCHMARK),
                 "factorial": [*FACTORIAL, FACTORIAL_REFERENCE],
                 "representation": list(REPRESENTATION_NEW),
+                "context": list(CONTEXT),
             }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)
