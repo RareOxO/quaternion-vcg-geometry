@@ -55,7 +55,12 @@ def validate_config(config):
     for key in ("quaternions", "kernel", "depth", "stem_stride"):
         if not isinstance(model[key], int) or model[key] < 1:
             raise ValueError(f"model.{key} must be a positive integer")
-    for key in ("real_width", "raw_width", "fusion_dim"):
+    if model.get("angular_algebra") is not None and model["angular_algebra"] not in (
+        "standard",
+        "quaternion",
+    ):
+        raise ValueError("model.angular_algebra must be standard or quaternion")
+    for key in ("real_width", "raw_width", "fusion_dim", "branch_width", "angular_quaternions"):
         if model.get(key) is not None and (not isinstance(model[key], int) or model[key] < 1):
             raise ValueError(f"model.{key} must be a positive integer when set")
     if model["kernel"] % 2 == 0:

@@ -5,6 +5,7 @@ the three models and the receptive field is the only systematic variable. Every 
 here defends exactly that.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -142,3 +143,19 @@ def test_earlier_variants_are_untouched(full_config):
     for name, channels in (("M0", 3), ("M1", 4), ("M4", 32), ("RU", 4), ("RLA", 8)):
         assert _model(full_config, name).frontend.out_channels == channels
     assert _model(full_config, "RLA").encoder.receptive_field == 640
+
+
+def test_encoder_stats_recomputes_rather_than_trusting_the_record(tmp_path, full_config):
+    """A run trained before the RF fix recorded 605; the table must still show 640."""
+    from qdg.experiments import encoder_stats
+
+    for name, recorded in (("RLA_seed42", 605), ("RLA_short_seed42", 45)):
+        run = tmp_path / name
+        run.mkdir()
+        config = experiment_config(full_config, name.rsplit("_seed", 1)[0])
+        (run / "config.json").write_text(json.dumps(config))
+        (run / "environment.json").write_text(json.dumps({"receptive_field_samples": recorded}))
+    stats = encoder_stats(tmp_path)
+    assert stats["RLA"]["receptive_field_samples"] == 640
+    assert stats["RLA"]["receptive_field_ms"] == 1280
+    assert stats["RLA_short"]["receptive_field_samples"] == 45

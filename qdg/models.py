@@ -36,11 +36,15 @@ from .quaternion_nn import TCNEncoder
 
 # Representation diagnostic of the v2 指导书 §3. All Real, single 20 ms scale.
 DIAGNOSTIC_VARIANTS = ("R", "RA", "RU", "RLA")
+# Branched RLA: one temporal encoder per block, so the angular operator can be swapped
+# in isolation (Angular temporal 指导书 §2). "RLAB" is the architecture; the operator is
+# chosen by model.angular_algebra.
+BRANCHED_VARIANTS = ("RLAB",)
 SINGLE_VARIANTS = ("M0", "M1", "M2", "M3", "M4", *DIAGNOSTIC_VARIANTS)
 # F_n keeps M0 as an intact raw branch and adds M_n as a second branch (双分支方案 §2).
 FUSION_PAIRS = {"F1": "M1", "F2": "M2", "F3": "M3", "F4": "M4"}
 FUSION_VARIANTS = tuple(FUSION_PAIRS)
-VARIANTS = (*SINGLE_VARIANTS, *FUSION_VARIANTS)
+VARIANTS = (*SINGLE_VARIANTS, *FUSION_VARIANTS, *BRANCHED_VARIANTS)
 
 VARIANT_DEFAULTS = {
     "M0": {"feature": "raw", "scales_ms": [], "algebra": "real"},
@@ -224,6 +228,118 @@ class FusionNet(nn.Module):
 
 
 def build_model(config, stats):
+    if config["variant"] in BRANCHED_VARIANTS:
+        return BranchedRLANet(config, stats)
     if config["variant"] in FUSION_VARIANTS:
         return FusionNet(config, stats)
     return GeometryNet(config, stats)
+
+
+BRANCH_BLOCKS = ("radial", "linear", "angular")
+
+
+class BranchedRLANet(nn.Module):
+    """R, L and A each get their own temporal encoder; only the angular one is ablated.
+
+    The single-encoder RLA of the previous round concatenates all eight channels before
+    the stem, so it has no separable angular encoder to swap. This architecture gives
+    each block its own encoder and joins them exactly like FusionNet does -- project each
+    to `fusion_dim`, concatenate, LayerNorm, one linear to the classes.
+
+    `angular_algebra="standard"` reads A as four ordinary real channels.
+    `angular_algebra="quaternion"` reads the same four numbers as one quaternion and
+    convolves with Hamilton-coupled kernels. Nothing else differs: the R and L branches,
+    the fusion, the head, the receptive field and the training recipe are shared, and
+    the angular widths are chosen so the two angular encoders hold the same weight count
+    (Angular temporal 指导书 §3/§4).
+
+    q_t = dot_t + cross_x i + cross_y j + cross_z k is a full-angle relation descriptor,
+    NOT a physical rotation quaternion, and a vanilla QuaternionConv gives no SO(3)
+    guarantee (§2.2, §9). The testable claim is only scalar-vector structured coupling.
+    """
+
+    def __init__(self, config, stats):
+        super().__init__()
+        algebra = config.get("angular_algebra", "standard")
+        if algebra not in ("standard", "quaternion"):
+            raise ValueError("model.angular_algebra must be standard or quaternion")
+        self.variant, self.angular_algebra = config["variant"], algebra
+        quaternions = config["angular_quaternions"]
+        branch_width = config["branch_width"]
+        # 4Q for the quaternion encoder, 2Q for the standard one: a quaternion conv holds
+        # 4*Q^2*K weights and a real conv of width W holds W^2*K, so W = 2Q equalizes them.
+        angular_width = 4 * quaternions if algebra == "quaternion" else 2 * quaternions
+        self.frontends = nn.ModuleDict(
+            {
+                block: VCGGeometry(
+                    "composite",
+                    config.get("scales_ms") or [20],
+                    stats["sampling_rate"],
+                    vcg_scale=stats["vcg_std"],
+                    blocks=[block],
+                )
+                for block in BRANCH_BLOCKS
+            }
+        )
+        shared = {
+            "kernel": config["kernel"],
+            "depth": config["depth"],
+            "stem_stride": config["stem_stride"],
+            "dropout": config["dropout"],
+        }
+        self.encoders = nn.ModuleDict(
+            {
+                block: TCNEncoder(
+                    self.frontends[block].out_channels,
+                    angular_width if block == "angular" else branch_width,
+                    quaternion=(block == "angular" and algebra == "quaternion"),
+                    **shared,
+                )
+                for block in BRANCH_BLOCKS
+            }
+        )
+        dim = config.get("fusion_dim") or branch_width
+        self.projections = nn.ModuleDict(
+            {block: nn.Linear(self.encoders[block].width, dim) for block in BRANCH_BLOCKS}
+        )
+        self.norm = nn.LayerNorm(len(BRANCH_BLOCKS) * dim)
+        self.head = nn.Linear(len(BRANCH_BLOCKS) * dim, len(CLASSES))
+        self.settings = {
+            "angular_algebra": algebra,
+            "angular_quaternions": quaternions,
+            "angular_width": angular_width,
+            "branch_width": branch_width,
+            "fusion_dim": dim,
+            "scales_ms": list(config.get("scales_ms") or [20]),
+            **shared,
+        }
+
+    def angular_parameters(self):
+        return sum(p.numel() for p in self.encoders["angular"].parameters())
+
+    def describe(self):
+        fields = {block: encoder.receptive_field for block, encoder in self.encoders.items()}
+        if len(set(fields.values())) != 1:
+            raise ValueError(f"Branch receptive fields must match, got {fields}")
+        return {
+            "encoder_parameters": sum(p.numel() for p in self.encoders.parameters()),
+            "receptive_field_samples": fields["angular"],
+            "input_channels": {
+                block: frontend.out_channels for block, frontend in self.frontends.items()
+            },
+            "angular_parameters": self.angular_parameters(),
+            "branch_parameters": {
+                block: sum(p.numel() for p in encoder.parameters())
+                for block, encoder in self.encoders.items()
+            },
+        }
+
+    def forward_features(self, ecg):
+        parts = [
+            self.projections[block](self.encoders[block](self.frontends[block](ecg)).float())
+            for block in BRANCH_BLOCKS
+        ]
+        return self.norm(torch.cat(parts, dim=-1))
+
+    def forward(self, ecg):
+        return self.head(self.forward_features(ecg))

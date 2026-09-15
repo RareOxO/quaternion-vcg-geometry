@@ -15,7 +15,8 @@ import torch
 
 from .data import CLASSES, load_manifest, save_json
 from .engine import evaluate, setup, train
-from .models import FUSION_PAIRS, build_model
+from .models import FUSION_PAIRS, SINGLE_VARIANTS, build_model
+from .quaternion_nn import receptive_field_samples
 
 # name -> model-config overrides applied on top of the base YAML.
 EXPERIMENTS = {
@@ -45,6 +46,20 @@ EXPERIMENTS = {
     # so the parameter counts stay within 1.3% of RLA-Long, which IS the existing RLA.
     "RLA_short": {"variant": "RLA", "depth": 1, "kernel": 5, "real_width": 127},
     "RLA_medium": {"variant": "RLA", "depth": 2, "kernel": 7, "real_width": 76},
+    # Angular temporal operator (Angular temporal 指导书 §6). Branched RLA so the angular
+    # encoder can be swapped alone; widths solved so the two hold matched weight counts.
+    "RLA_standard": {
+        "variant": "RLAB",
+        "angular_algebra": "standard",
+        "angular_quaternions": 22,
+        "branch_width": 32,
+    },
+    "RLA_quaternion": {
+        "variant": "RLAB",
+        "angular_algebra": "quaternion",
+        "angular_quaternions": 22,
+        "branch_width": 32,
+    },
 }
 MAIN = ("M0", "M1", "M2", "M3", "M4")
 # v2 指导书 §8: M0 and M1 are existing anchors, never retrained for this stage.
@@ -78,6 +93,11 @@ TEMPORAL_DIFFS = (
     ("Long - Medium", "RLA", "RLA_medium"),
     ("Long - Short", "RLA", "RLA_short"),
 )
+# Angular temporal 指导书 §6/§7. Both are trained: the single-encoder RLA-Long has no
+# separable angular encoder, so it does not meet the §6 reuse condition.
+ANGULAR = (("RLA-Standard", "RLA_standard"), ("RLA-Quaternion", "RLA_quaternion"))
+ANGULAR_NEW = ("RLA_standard", "RLA_quaternion")
+
 FUSION = ("M0", "M0_wide", "F1", "F2", "F3", "F4")
 # 双分支方案 §12: train M0 / M0_wide / F1 first and stop for a decision on F1.
 FUSION_STAGE_A = ("M0", "M0_wide", "F1")
@@ -340,6 +360,7 @@ def tables(root):
     fusion_tables(root, summary)
     diagnostic_tables(root, summary)
     temporal_tables(root, summary, encoder_stats(root))
+    angular_tables(root, summary, angular_stats(root))
     return summary
 
 
@@ -531,20 +552,31 @@ def diagnostic_tables(root, summary):
 
 
 def encoder_stats(root):
-    """experiment name -> the receptive field each run actually recorded at train time.
+    """experiment name -> receptive field, recomputed from each run's saved config.
 
-    Read back from environment.json rather than recomputed, so the table reports the
-    encoder that produced the number, not whatever the current config would build.
+    Deliberately NOT read back from environment.json: a run trained before the field
+    calculator was corrected recorded the old closed-form value, which would put a
+    stale number next to freshly computed ones in the same table. The architecture is
+    fully determined by the config the run stored, so recomputing is both authoritative
+    and consistent across runs of different vintages (§5).
     """
     stats = {}
-    for path in sorted(Path(root).rglob("environment.json")):
-        environment = json.loads(path.read_text())
-        name = path.parent.name.rsplit("_seed", 1)[0]
-        samples = environment.get("receptive_field_samples")
-        if samples is None:
+    for path in sorted(Path(root).rglob("config.json")):
+        config = json.loads(path.read_text())
+        model, data = config.get("model"), config.get("data", {})
+        if not model:
             continue
-        rate = environment.get("sampling_rate", 500)
-        stats[name] = {
+        if model["variant"] not in SINGLE_VARIANTS:
+            continue  # a fusion model has two encoders; no single field applies
+        layers = [(model["stem_stride"],) * 2 + (1,)]
+        kernel = 1 if model.get("operator", "conv") == "mlp" else model["kernel"]
+        for index in range(model["depth"]):
+            if index:
+                layers.append((2, 2, 1))
+            layers += [(kernel, 1, 1), (kernel, 1, 1)]
+        samples = receptive_field_samples(layers)
+        rate = data.get("sampling_rate", 500)
+        stats[path.parent.name.rsplit("_seed", 1)[0]] = {
             "receptive_field_samples": samples,
             "receptive_field_ms": round(1000 * samples / rate),
         }
@@ -648,3 +680,122 @@ def interpret_temporal(gap):
         "monotone, so seed 42 alone does not support a temporal claim.\n\n"
         "Next: add seeds only if the gap sits near the noise boundary."
     )
+
+
+def angular_tables(root, summary, angular=None):
+    """Tables of the Angular temporal 指导书 §7, written to angular_tables.md."""
+    root = Path(root)
+    if not all(name in summary for name in ANGULAR_NEW):
+        if not any(name in summary for name in ANGULAR_NEW):
+            return None
+    angular = angular or {}
+    present = [(label, name) for label, name in ANGULAR if name in summary]
+    main = _table(
+        ["Model", "Total Params", "Angular Params", "RF (ms)", "Macro AUROC", *CLASSES],
+        [
+            [
+                label,
+                f"{summary[name]['parameters']:,}",
+                f"{angular.get(name, {}).get('angular_parameters', '?'):,}"
+                if angular.get(name, {}).get("angular_parameters")
+                else "?",
+                str(angular.get(name, {}).get("receptive_field_ms", "?")),
+                _cell(summary[name], "macro_auroc"),
+                *[_cell(summary[name], cls) for cls in CLASSES],
+            ]
+            for label, name in present
+        ],
+    )
+    standard, quaternion = "RLA_standard", "RLA_quaternion"
+    diffs, verdict = "", "**Incomplete.** Train both angular encoders before reading a verdict."
+    if standard in summary and quaternion in summary:
+        gap = summary[quaternion]["macro_auroc_mean"] - summary[standard]["macro_auroc_mean"]
+        rows = [["Macro AUROC", f"{gap:+.4f}"]]
+        rows += [
+            [cls, f"{summary[quaternion][f'{cls}_mean'] - summary[standard][f'{cls}_mean']:+.4f}"]
+            for cls in CLASSES
+        ]
+        total = summary[quaternion]["parameters"] - summary[standard]["parameters"]
+        rows.append(
+            [
+                "Total params",
+                f"{total:+,} ({total / summary[standard]['parameters']:+.2%})",
+            ]
+        )
+        if angular.get(standard, {}).get("angular_parameters"):
+            delta = (
+                angular[quaternion]["angular_parameters"] - angular[standard]["angular_parameters"]
+            )
+            rows.append(
+                [
+                    "Angular params",
+                    f"{delta:+,} ({delta / angular[standard]['angular_parameters']:+.2%})",
+                ]
+            )
+        diffs = _table(["Quantity", "Quaternion - Standard"], rows)
+        verdict = interpret_angular(gap)
+    text = (
+        "# Angular temporal modelling: Standard vs Quaternion\n\n"
+        "One angular sequence, two temporal operators. The R and L branches, the input\n"
+        "A tensor, the receptive field, the fusion, the head and the recipe are shared;\n"
+        "only the angular encoder changes. Seed 42 only, noise band "
+        f"{NOISE_BAND:.4f}.\n\n"
+        "The descriptor q = dot + cross_x i + cross_y j + cross_z k is a full-angle\n"
+        "relation, not a physical rotation quaternion, and a vanilla QuaternionConv\n"
+        "carries no SO(3) guarantee. The claim under test is only whether Hamilton\n"
+        "scalar-vector coupling is a better inductive bias for this sequence.\n\n"
+        "## Table 13: Angular operator results\n\n"
+        + main
+        + "\n\n"
+        + ("## Table 14: Quaternion - Standard\n\n" + diffs + "\n\n" if diffs else "")
+        + "## Verdict\n\n"
+        + verdict
+        + "\n"
+    )
+    missing = [name for _, name in ANGULAR if name not in summary]
+    if missing:
+        text += f"\nNot yet trained: {', '.join(missing)}\n"
+    (root / "angular_tables.md").write_text(text, encoding="utf-8")
+    print(text, flush=True)
+    return text
+
+
+def interpret_angular(gap):
+    """The §8 decision table. 0.005 is this project's screening band, not a p-value."""
+    band = NOISE_BAND
+    if gap > band:
+        return (
+            f"**A signal worth more seeds.** Quaternion - Standard is {gap:+.4f}, above "
+            f"the {band:.3f} screening band, so Hamilton-structured angular temporal "
+            "modelling shows a seed-42 advantage worth confirming.\n\n"
+            "Next: train both with seeds 43/44. No formal claim before that."
+        )
+    if gap < -band:
+        return (
+            f"**Standard is ahead.** Quaternion - Standard is {gap:+.4f}, below "
+            f"-{band:.3f}, so Hamilton-structured angular temporal modelling does not "
+            "hold an advantage here.\n\nNext: stop the Quaternion line; do not stack "
+            "further Quaternion layers in the hope of recovering it."
+        )
+    return (
+        f"**Indistinguishable.** Quaternion - Standard is {gap:+.4f}, inside the "
+        f"{band:.3f} band, so the two inductive biases cannot be told apart at seed 42."
+        "\n\nNext: do not extend the Quaternion architecture. Stop here."
+    )
+
+
+def angular_stats(root):
+    """experiment name -> angular encoder parameter count and receptive field."""
+    stats = {}
+    for path in sorted(Path(root).rglob("environment.json")):
+        environment = json.loads(path.read_text())
+        if "angular_parameters" not in environment:
+            continue
+        samples = environment["receptive_field_samples"]
+        rate = environment.get("sampling_rate", 500)
+        stats[path.parent.name.rsplit("_seed", 1)[0]] = {
+            "angular_parameters": environment["angular_parameters"],
+            "receptive_field_samples": samples,
+            "receptive_field_ms": round(1000 * samples / rate),
+        }
+    return stats

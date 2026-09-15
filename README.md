@@ -139,6 +139,36 @@ python -m qdg suite --stage temporal --seeds 42   # RLA_short, RLA_medium; Long 
 
 Results and verdict go to `runs/temporal_tables.md`.
 
+## Angular temporal operator: Standard vs Quaternion
+
+Longer context helps, so this stage fixes the context and asks *how* the angular
+sequence should be modelled. One A tensor, two temporal operators.
+
+| | Angular encoder | Angular width | Angular params | Total params | RF |
+|---|---|---|---|---|---|
+| RLA-Standard | 4 real channels, standard conv | 44 | 79,508 | 168,025 | 1280 ms |
+| RLA-Quaternion | `q = dot + cross_x i + cross_y j + cross_z k`, Hamilton conv | 88 | 78,870 | 168,795 | 1280 ms |
+
+Both use the branched architecture (`RLAB`): R, L and A each get their own encoder,
+joined by the same projection + concat + LayerNorm + linear. The R and L branches, the
+A tensor, the receptive field, the fusion, the head and the recipe are shared; only the
+angular operator differs. Angular widths are 2Q and 4Q so the two hold matched weight
+counts (0.8% apart); totals are 0.46% apart.
+
+**The previous single-encoder `RLA` cannot serve as the Standard control**: it
+concatenates all eight channels before one stem, so it has no separable angular encoder.
+Both models are therefore trained fresh, and `RLA-Long`'s 0.9186 is not reused here.
+
+`q` is a full-angle relation descriptor, not a physical rotation quaternion, and a
+vanilla QuaternionConv carries no SO(3) guarantee. The claim under test is only whether
+Hamilton scalar-vector coupling is a better inductive bias for this sequence.
+
+```bash
+python -m qdg suite --stage angular --seeds 42
+```
+
+Results and verdict go to `runs/angular_tables.md`.
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five

@@ -7,6 +7,7 @@ from .data import audit, prepare
 from .engine import evaluate, train
 from .experiments import (
     EXPERIMENTS,
+    ANGULAR_NEW,
     DIAGNOSTIC_NEW,
     FUSION,
     FUSION_STAGE_A,
@@ -56,7 +57,7 @@ def main():
             # before F2-F4 are spent.
             group.add_argument(
                 "--stage",
-                choices=("stage-a", "fusion", "diagnostic", "temporal"),
+                choices=("stage-a", "fusion", "diagnostic", "temporal", "angular"),
                 help="stage-a: M0, M0_wide, F1; fusion: the F ladder; "
                 "diagnostic: R, RA, RU, RLA; temporal: RLA_short and RLA_medium "
                 "(anchors M0/M1/RLA are reused, never retrained)",
@@ -105,6 +106,7 @@ def main():
                 "fusion": list(FUSION),
                 "diagnostic": list(DIAGNOSTIC_NEW),
                 "temporal": list(TEMPORAL_NEW),
+                "angular": list(ANGULAR_NEW),
             }
             names = args.experiments or stage.get(args.stage) or list(EXPERIMENTS)
             result = suite(config, names, args.seeds)
