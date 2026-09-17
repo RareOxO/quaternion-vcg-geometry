@@ -1,4 +1,4 @@
-"""B0 and V0, the two baselines every Quaternion-LVCG variant is compared against.
+"""Baselines and Quaternion-LVCG variants, all trained with the same classification loss.
 
 B0  Traditional VCG. ECG -> fixed lift -> VCG [B, 3, T] -> a small real-valued 1D CNN
     -> global average pooling -> linear multi-label head. No beat bottleneck, no
@@ -10,24 +10,10 @@ B0's lift is V0's lift -- the same Table 7 lead geometry and the same Tikhonov
 pseudo-inverse with the same eps -- so B0 and V0 receive an identical VCG and the gap
 between them is the latent beat architecture, not a different ECG-to-VCG transform.
 
-V0 is run under two objectives (master prompt section E):
-
-    V0-A  L = L_cls
-    V0-B  L = lambda_cls L_cls + lambda_ecg L_ECG + lambda_beat L_beat
-              + lambda_base L_base + lambda_temporal L_temp
-
-The auxiliary terms are the author's own functions and weights (``scripts/train.py``
-and ``configs/train/lvcg_v5_gru.yaml``); ``lambda_cls`` is not in that config and is 1.
-They need the author's masked training pass, which lifts only three random visible
-leads, whereas classification uses all twelve. Classifying from the masked pass would
-train the head on a view the test set never shows, so V0-B runs both passes over shared
-weights: the classifier input is then identical in V0-A and V0-B, and the comparison
-isolates the effect of the auxiliary objective.
-
-One property of the author's reconstruction path carries into L_ECG unchanged: its
-BeatStitcher cross-fades with windows that reach exactly zero at the first and last
-sample of every inner beat and places beats without overlap, so the reconstruction is
-zero at roughly two samples per beat boundary (about 2% of a record).
+V0 is one classification-only baseline (updated master prompt, section E): no
+reconstruction or temporal self-supervised objective, and that same objective is the
+fixed protocol for every later variant. Runs made before this change under the name
+``V0A`` are exactly that configuration and are read as ``V0``.
 """
 
 import torch
@@ -35,8 +21,7 @@ from torch import nn
 
 from lvcg.data import get_lead_directions
 from lvcg.models.heads import ClassificationHead
-from lvcg.models.lvcg import LVCG, base_beat_loss, beat_level_loss, temporal_loss
-from lvcg.models.utils.loss import masked_reconstruction_loss, random_lead_mask
+from lvcg.models.lvcg import LVCG
 from lvcg.models.vcg import VCGPseudoInverse
 
 from qdg.data import CLASSES
@@ -52,32 +37,21 @@ from .quaternion_utils import (
 # The eps LVCG hard-codes for its lift; B0 must use the same one.
 LIFT_EPS = 0.1
 
-OBJECTIVES = ("classification", "classification+auxiliary")
-# V1-V8 use whichever objective won V0A vs V0B. "protocol" defers to the config, which
-# refuses to train until that choice has been recorded.
-FROM_PROTOCOL = "protocol"
-
 EXPERIMENTS = {
     "B0": {
         "model": "traditional_vcg",
-        "objective": "classification",
         "variant": "traditional_vcg",
         "report": "reports/B0_TRADITIONAL_VCG_report.md",
     },
-    "V0A": {
+    "V0": {
         "model": "lvcg",
-        "objective": "classification",
-        "variant": "lvcg_cls",
-        "report": "reports/V0_SUPERVISED_LVCG_report.md",
-    },
-    "V0B": {
-        "model": "lvcg",
-        "objective": "classification+auxiliary",
-        "variant": "lvcg_cls_aux",
+        "variant": "lvcg",
         "report": "reports/V0_SUPERVISED_LVCG_report.md",
     },
 }
-_V1 = {"model": "qdf_lvcg", "objective": FROM_PROTOCOL, "report": "reports/V1_QDF_report.md"}
+# Names runs and checkpoints were saved under before V0 became a single baseline.
+LEGACY_NAMES = {"V0A": "V0"}
+_V1 = {"model": "qdf_lvcg", "report": "reports/V1_QDF_report.md"}
 EXPERIMENTS.update(
     {
         # The full feature set, then the section G ablation, then the section O control.
@@ -92,7 +66,7 @@ EXPERIMENTS.update(
         },
     }
 )
-_V2 = {"model": "qdt_lvcg", "objective": FROM_PROTOCOL, "report": "reports/V2_QDT_report.md"}
+_V2 = {"model": "qdt_lvcg", "report": "reports/V2_QDT_report.md"}
 EXPERIMENTS.update(
     {
         # Section H: concat + projection by default, gated fusion as the option, and the
@@ -117,6 +91,34 @@ EXPERIMENTS.update(
         },
     }
 )
+_V3 = {"model": "mrq_lvcg", "report": "reports/V3_MRQ_report.md"}
+EXPERIMENTS.update(
+    {
+        # Section I's six ablations over {VCG, Magnitude, Rotation}, then the control.
+        "V3": {**_V3, "variant": "mrq_lvcg", "branches": ("vcg", "magnitude", "rotation")},
+        "V3mag": {**_V3, "variant": "mrq_magnitude_only", "branches": ("magnitude",)},
+        "V3rot": {**_V3, "variant": "mrq_rotation_only", "branches": ("rotation",)},
+        "V3magrot": {
+            **_V3,
+            "variant": "mrq_magnitude_rotation",
+            "branches": ("magnitude", "rotation"),
+        },
+        "V3vcgmag": {**_V3, "variant": "mrq_vcg_magnitude", "branches": ("vcg", "magnitude")},
+        # [e_base ; e_rot] with the rotation branch on q, theta, omega is V1, layer for
+        # layer and parameter for parameter, so it is read from the V1 run.
+        "V3vcgrot": {
+            **_V3,
+            "variant": "mrq_vcg_rotation",
+            "branches": ("vcg", "rotation"),
+            "reuses": "V1",
+        },
+        "V3ctrl": {
+            **_V3,
+            "variant": "mrq_real_control",
+            "branches": ("vcg", "position", "delta"),
+        },
+    }
+)
 QUATERNION_FEATURES = ("q", "theta", "omega", "magnitude", "linear_velocity")
 CONTROL_FEATURES = ("position", "next_position", "delta")
 FEATURE_CHANNELS = {
@@ -130,7 +132,7 @@ FEATURE_CHANNELS = {
     "delta": 3,
 }
 # Modules the classification path of LVCG never touches. They are counted separately
-# so a parameter count does not credit V0-A with decoders it does not use.
+# so a parameter count does not credit V0 with decoders it never uses.
 LVCG_RECONSTRUCTION_ONLY = ("beat_decoder", "ecg_decoder", "struct_proj", "dynamic_proj")
 
 
@@ -198,24 +200,6 @@ class SupervisedLVCG(nn.Module):
     def forward(self, ecg):
         return self.head(self.backbone.forward_inference(ecg, use_all_leads=True))
 
-    def auxiliary_losses(self, ecg, num_visible):
-        """The author's pretraining losses, computed exactly as ``scripts/train.py`` does."""
-        visible, mask = random_lead_mask(
-            ecg.shape[0], num_leads=ecg.shape[1], num_visible=num_visible, device=ecg.device
-        )
-        out = self.backbone.forward_train(ecg, visible)
-        predicted, target = out["V_hat_beats"], out["V_beats"]
-        if predicted.shape[1] == target.shape[1]:
-            beat = beat_level_loss(predicted, target, out["beat_mask_full"])
-        else:  # the TTT path decodes N beats but encodes only the N-2 core ones
-            beat = beat_level_loss(predicted[:, 1:-1], target, out["beat_mask_full"][:, 1:-1])
-        return {
-            "ecg": masked_reconstruction_loss(out["recon"], ecg, mask),
-            "temporal": temporal_loss(out["states_pred"], out["states_real"], out["beat_mask"]),
-            "beat": beat,
-            "base": base_beat_loss(out["V_base_hat"], out["V_base"]),
-        }
-
     def parameter_counts(self):
         total = sum(p.numel() for p in self.parameters())
         unused = sum(
@@ -240,7 +224,7 @@ def _check_features(features):
 _IDENTITY = (1.0, 0.0, 0.0, 0.0)
 
 
-def transition_features(p, mask, features, dt, sign_continuity=True):
+def transition_features(p, mask, features, dt, sign_continuity=True, with_mask=True):
     """Per-transition features of a trajectory p [..., T, 3] -> [..., T - 1, C].
 
     ``mask`` [..., T - 1] marks transitions with a reliable direction; ``dt`` is a float
@@ -272,7 +256,8 @@ def transition_features(p, mask, features, dt, sign_continuity=True):
     if "linear_velocity" in features:
         parts["linear_velocity"] = _safe_norm(following - current, keepdim=True) / dt
     parts.update(position=current, next_position=following, delta=following - current)
-    return torch.cat([parts[f] for f in features] + [mask.unsqueeze(-1).to(p.dtype)], -1)
+    extra = [mask.unsqueeze(-1).to(p.dtype)] if with_mask else []
+    return torch.cat([parts[f] for f in features] + extra, -1)
 
 
 class QuaternionDynamicFeatures(nn.Module):
@@ -292,18 +277,21 @@ class QuaternionDynamicFeatures(nn.Module):
     ``transition_features`` for the masking and sign rules.
     """
 
-    def __init__(self, features, dt, min_fraction=0.02, sign_continuity=True):
+    def __init__(self, features, dt, min_fraction=0.02, sign_continuity=True, with_mask=True):
         super().__init__()
         self.features = _check_features(features)
         self.dt = float(dt)
         self.min_fraction = float(min_fraction)
         self.sign_continuity = bool(sign_continuity)
-        self.channels = sum(FEATURE_CHANNELS[f] for f in self.features) + 1
+        self.with_mask = bool(with_mask)
+        self.channels = sum(FEATURE_CHANNELS[f] for f in self.features) + int(self.with_mask)
 
     def forward(self, vcg):
         p = vcg.transpose(1, 2)  # [B, T, 3]
         mask = valid_rotation_mask(p, lag=1, min_fraction=self.min_fraction)
-        x = transition_features(p, mask, self.features, self.dt, self.sign_continuity)
+        x = transition_features(
+            p, mask, self.features, self.dt, self.sign_continuity, self.with_mask
+        )
         return x.transpose(1, 2), mask
 
 
@@ -381,8 +369,7 @@ class QDFLVCG(SupervisedLVCG):
         logits = Linear([e_base ; e_Q])
 
     The VCG is lifted with the backbone's own direction buffer and pseudo-inverse, so
-    e_Q is computed from the same VCG the backbone segments. The auxiliary losses, if
-    the V0 protocol selected them, are inherited unchanged and act on the backbone only.
+    e_Q is computed from the same VCG the backbone segments.
     """
 
     def __init__(
@@ -479,10 +466,6 @@ class QDTLVCG(SupervisedLVCG):
     aggregation in general. The later beats' quaternion tokens are computed and fused
     all the same, which keeps V2 faithful to section H and ready for a temporal module
     that reads them. A test pins this property.
-
-    Only the classification objective is supported: the author's auxiliary losses run
-    ``forward_train``, which knows nothing of the fusion, so reusing them would train a
-    different token than the one classified.
     """
 
     def __init__(
@@ -546,11 +529,6 @@ class QDTLVCG(SupervisedLVCG):
     def forward(self, ecg):
         return self.head(self.embed(ecg))
 
-    def auxiliary_losses(self, ecg, num_visible):
-        raise NotImplementedError(
-            "V2 is classification-only: the author's auxiliary losses bypass the token fusion"
-        )
-
     def parameter_counts(self):
         counts = super().parameter_counts()
         counts["dynamic_branch"] = sum(
@@ -561,7 +539,131 @@ class QDTLVCG(SupervisedLVCG):
         return counts
 
 
+# V3 branches: the features each one encodes, and whether it also sees the validity mask.
+# The magnitude branch encodes r_t alone: the mask is a threshold on r_t, so it would add
+# nothing, and leaving it out makes the real-valued control match V3 channel for channel
+# (1 + 7 inputs against 4 + 4).
+MRQ_BRANCHES = {
+    "magnitude": (("magnitude",), False),
+    "rotation": (("q", "theta", "omega"), True),
+    "position": (("position",), True),
+    "delta": (("delta",), True),
+}
+
+
+class MRQLVCG(nn.Module):
+    """V3: the cardiac vector factorised as magnitude and rotation, P_t = r_t u_t.
+
+        vcg        LVCG(ECG)                                        e_base  640-d
+        magnitude  r_t = ||P_t||              -> DynamicEncoder     e_mag   128-d
+        rotation   q_t = Rot(u_t -> u_{t+1}), theta_t, omega_t
+                                              -> DynamicEncoder     e_rot   128-d
+        logits = Linear([present branches])
+
+    Any non-empty subset of branches can be switched on, which is how section I's six
+    ablations are built. Without the ``vcg`` branch no LVCG backbone is instantiated at
+    all, and the VCG comes from the same fixed lift B0 and V0 use; with it, the backbone's
+    own lift is used, which is numerically the same one. The rotation branch is V1's
+    dynamic branch exactly -- same features, same encoder -- so V3 with {vcg, rotation}
+    is V1. The real-valued control replaces magnitude and rotation with the Cartesian
+    pair P_t and P_{t+1} - P_t, keeping the branch count and every layer size.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        lvcg,
+        branches,
+        embedding_dim=128,
+        hidden=64,
+        kernel=7,
+        dropout=0.1,
+        min_magnitude_fraction=0.02,
+        sign_continuity=True,
+    ):
+        super().__init__()
+        branches = tuple(branches)
+        unknown = [b for b in branches if b != "vcg" and b not in MRQ_BRANCHES]
+        if not branches or unknown or len(set(branches)) != len(branches):
+            raise ValueError(f"Invalid branch set {branches!r}")
+        self.branches = branches
+        self.extra = tuple(b for b in branches if b != "vcg")
+        if "vcg" in branches:
+            self.backbone = LVCG(**lvcg)
+            base_dim = self.backbone.out_features
+        else:
+            self.backbone = None
+            self.lift = VCGPseudoInverse(eps=LIFT_EPS)
+            self.register_buffer(
+                "directions", get_lead_directions(lvcg["lead_order"], as_tensor=True)
+            )
+            base_dim = 0
+        dt = 1.0 / lvcg["fs"]
+        self.branch_features = nn.ModuleDict(
+            {
+                name: QuaternionDynamicFeatures(
+                    MRQ_BRANCHES[name][0],
+                    dt,
+                    min_magnitude_fraction,
+                    sign_continuity,
+                    with_mask=MRQ_BRANCHES[name][1],
+                )
+                for name in self.extra
+            }
+        )
+        self.branch_encoders = nn.ModuleDict(
+            {
+                name: DynamicEncoder(
+                    self.branch_features[name].channels, embedding_dim, hidden, kernel, dropout
+                )
+                for name in self.extra
+            }
+        )
+        self.head = ClassificationHead(
+            "linear", base_dim + embedding_dim * len(self.extra), num_classes
+        )
+        self.embedding_dim = embedding_dim
+
+    def vcg(self, ecg):
+        if self.backbone is not None:
+            directions = self.backbone.all_lead_directions.expand(ecg.shape[0], -1, -1)
+            return self.backbone.vcg_inverse(ecg, directions)
+        return self.lift(ecg, self.directions.expand(ecg.shape[0], -1, -1))
+
+    def forward(self, ecg):
+        parts = []
+        if self.backbone is not None:
+            parts.append(self.backbone.forward_inference(ecg, use_all_leads=True))
+        if self.extra:
+            vcg = self.vcg(ecg)
+            for name in self.extra:
+                features, _ = self.branch_features[name](vcg)
+                parts.append(self.branch_encoders[name](features))
+        return self.head(torch.cat(parts, dim=-1))
+
+    def parameter_counts(self):
+        total = sum(p.numel() for p in self.parameters())
+        unused = (
+            sum(
+                p.numel()
+                for name in LVCG_RECONSTRUCTION_ONLY
+                for p in getattr(self.backbone, name).parameters()
+            )
+            if self.backbone is not None
+            else 0
+        )
+        head_per_branch = self.embedding_dim * self.head.net.out_features
+        counts = {"total": total, "classification_path": total - unused}
+        for name in self.extra:
+            counts[f"{name}_branch"] = (
+                sum(p.numel() for p in self.branch_encoders[name].parameters()) + head_per_branch
+            )
+        counts["dynamic_branch"] = sum(counts[f"{name}_branch"] for name in self.extra)
+        return counts
+
+
 def build_model(config, experiment):
+    experiment = LEGACY_NAMES.get(experiment, experiment)
     if experiment not in EXPERIMENTS:
         raise ValueError(f"Unknown experiment {experiment!r}; expected one of {list(EXPERIMENTS)}")
     kind = EXPERIMENTS[experiment]["model"]
@@ -611,6 +713,18 @@ def build_model(config, experiment):
             min_magnitude_fraction=settings["min_magnitude_fraction"],
             sign_continuity=settings["sign_continuity"],
         )
+    if kind == "mrq_lvcg":
+        return MRQLVCG(
+            len(CLASSES),
+            config["model"]["lvcg"],
+            EXPERIMENTS[experiment]["branches"],
+            embedding_dim=settings["embedding_dim"],
+            hidden=settings["hidden"],
+            kernel=settings["kernel"],
+            dropout=settings["dropout"],
+            min_magnitude_fraction=settings["min_magnitude_fraction"],
+            sign_continuity=settings["sign_continuity"],
+        )
     if kind == "traditional_vcg":
         return TraditionalVCG(
             len(CLASSES),
@@ -633,28 +747,34 @@ def record_shapes(model, ecg):
 
         return save
 
-    if isinstance(model, SupervisedLVCG):
-        stages = {
-            "vcg (vcg_inverse)": model.backbone.vcg_inverse,
-            "beats, rr, mask (beat_segmenter)": model.backbone.beat_segmenter,
-            "beat tokens (beat_encoder)": model.backbone.beat_encoder,
-            "states_pred, h_last (state_generator)": model.backbone.state_generator,
-            "emb_rhythm (global_rr_embedding)": model.backbone.global_rr_embedding,
-            "logits (head)": model.head,
-        }
-        if isinstance(model, QDFLVCG):
-            stages["features, mask (dynamics)"] = model.dynamics
-            stages["e_Q (dynamic_encoder)"] = model.dynamic_encoder
-        if isinstance(model, QDTLVCG):
-            stages["beat features, mask (beat_dynamics)"] = model.beat_dynamics
-            stages["z_Q valid beats (quaternion_beat_encoder)"] = model.quaternion_beat_encoder
-            stages["fused tokens (fusion)"] = model.fusion
-    else:
-        stages = {
-            "vcg (lift)": model.lift,
-            "features (encoder)": model.encoder,
-            "logits (head)": model.head,
-        }
+    stages = {}
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None:
+        stages.update(
+            {
+                "vcg (vcg_inverse)": backbone.vcg_inverse,
+                "beats, rr, mask (beat_segmenter)": backbone.beat_segmenter,
+                "beat tokens (beat_encoder)": backbone.beat_encoder,
+                "states_pred, h_last (state_generator)": backbone.state_generator,
+                "emb_rhythm (global_rr_embedding)": backbone.global_rr_embedding,
+            }
+        )
+    elif hasattr(model, "lift"):
+        stages["vcg (lift)"] = model.lift
+    if isinstance(model, TraditionalVCG):
+        stages["features (encoder)"] = model.encoder
+    if isinstance(model, QDFLVCG):
+        stages["features, mask (dynamics)"] = model.dynamics
+        stages["e_Q (dynamic_encoder)"] = model.dynamic_encoder
+    if isinstance(model, QDTLVCG):
+        stages["beat features, mask (beat_dynamics)"] = model.beat_dynamics
+        stages["z_Q valid beats (quaternion_beat_encoder)"] = model.quaternion_beat_encoder
+        stages["fused tokens (fusion)"] = model.fusion
+    if isinstance(model, MRQLVCG):
+        for name in model.extra:
+            stages[f"{name} features, mask"] = model.branch_features[name]
+            stages[f"e_{name}"] = model.branch_encoders[name]
+    stages["logits (head)"] = model.head
     handles = [module.register_forward_hook(hook(name)) for name, module in stages.items()]
     try:
         with torch.no_grad():

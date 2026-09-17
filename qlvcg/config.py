@@ -49,13 +49,6 @@ def validate_config(config):
             raise ValueError(f"training.{key} must be a positive integer")
     if not isinstance(train["warmup_steps"], int) or train["warmup_steps"] < 0:
         raise ValueError("training.warmup_steps must be a non-negative integer")
-    if not 1 <= config["objective"]["num_visible"] <= lvcg["num_leads"] - 1:
-        raise ValueError("objective.num_visible must leave at least one lead masked")
-    objective = config.get("protocol", {}).get("objective")
-    if objective not in (None, "classification", "classification+auxiliary"):
-        raise ValueError(
-            "protocol.objective must be null, classification or classification+auxiliary"
-        )
     if len(CLASSES) != 5:
         raise ValueError("The PTB-XL superclass task has five labels")
     return config

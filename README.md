@@ -291,7 +291,7 @@ Panel A, the R-peak-relative heatmap on one symmetric scale clipped at the 99th
 percentile; Panel B, DEP against REP density per disease and branch with patient
 bootstrap intervals; Panel C, the R/L/Q composition inside each phase.
 
-## Latent VCG track: B0 and V0 (supervised PTB-XL)
+## Latent VCG track: B0, V0 and V1-V3 (supervised PTB-XL)
 
 The second project line extends the Latent VCG framework (LVCG, ICML 2026) with
 Quaternion structure. Every model is trained from scratch, end to end, on the same PTB-XL
@@ -313,12 +313,11 @@ own `BeatStitcher` is used in the tests to confirm it.
   188,741 parameters. Because the lift is identical, B0 vs V0 isolates the latent beat
   architecture.
 - **V0 Supervised LVCG** -- the unmodified `LVCG` class with a linear head on its 640-d
-  embedding. 8,288,265 parameters, 7,296,517 of them on the classification path.
-  - **V0A** classification loss only.
-  - **V0B** adds the author's reconstruction losses with the author's weights. The masked
-    pass the auxiliary losses need lifts only three leads, so V0B runs it alongside the
-    all-lead classification pass over shared weights; the classifier input is then
-    identical in V0A and V0B.
+  embedding. 8,288,265 parameters, 7,296,517 of them on the classification path. One
+  classification-only baseline, as the updated master prompt requires: none of the
+  author's reconstruction or temporal self-supervised losses, and the same objective is
+  the fixed protocol for every later variant. Runs saved as `V0A` before this change are
+  that exact configuration and are read as `V0`.
 
 The PTB-XL split and superclass labels are the official folds used everywhere else in
 this repository, which were checked to match the LVCG/MELP benchmark split record for
@@ -333,8 +332,7 @@ python -m pytest -q tests/test_lvcg_data.py tests/test_qlvcg.py
 
 python -m qlvcg profile --experiment B0      # shapes, parameters, protocol, before training
 python -m qlvcg train --experiment B0
-python -m qlvcg train --experiment V0A
-python -m qlvcg train --experiment V0B
+python -m qlvcg train --experiment V0
 python -m qlvcg tables --root runs           # reports/EXPERIMENT_HISTORY.md
 ```
 
@@ -361,17 +359,13 @@ normalisation is scale-invariant, so `V1theta` and `V1omega` see the same input:
 them to differ only by noise. Section O asks for the control only once a variant shows
 promise.
 
-V1-V8 train with the objective V0 selects. `protocol.objective` in `configs/lvcg.yaml`
-is left null on purpose, and V1 refuses to train until it is set (or `--objective` is
-passed):
-
 ```bash
 python -m qlvcg sanity                       # section 9 numerical checks on real records
-python -m qlvcg train --experiment V1 --objective classification   # the V0 winner's objective
-python -m qlvcg train --experiment V1q --objective classification
-python -m qlvcg train --experiment V1theta --objective classification
-python -m qlvcg train --experiment V1omega --objective classification
-python -m qlvcg train --experiment V1ctrl --objective classification
+python -m qlvcg train --experiment V1
+python -m qlvcg train --experiment V1q
+python -m qlvcg train --experiment V1theta
+python -m qlvcg train --experiment V1omega
+python -m qlvcg train --experiment V1ctrl
 ```
 
 ### V2 QDT-LVCG: a quaternion token per beat
@@ -397,11 +391,43 @@ One property of the released temporal module decides what V2 can show: StateGRU 
 not read the token sequence -- it rolls out from the first complete beat's token, which
 is also the structural embedding. Only beat 1's fused token therefore reaches the logits
 (a test pins this), so V2 vs V1 compares one beat's rotation trajectory with the whole
-record's. V2 is classification-only; the author's auxiliary losses bypass the fusion.
+record's.
 
 ```bash
-python -m qlvcg train --experiment V2 --objective classification
-python -m qlvcg train --experiment V2gated --objective classification
+python -m qlvcg train --experiment V2
+python -m qlvcg train --experiment V2gated
+```
+
+### V3 MRQ-LVCG: magnitude and rotation as separate branches
+
+V3 factorises the cardiac vector as P_t = r_t u_t and gives each factor its own branch:
+magnitude encodes r_t = ||P_t||, rotation encodes q_t = Rot(u_t -> u_{t+1}), theta_t and
+omega_t -- V1's dynamic branch exactly. The linear head reads the concatenation of the
+branches present; with the `vcg` branch that includes V0's 640-d embedding, without it no
+LVCG backbone is built and the VCG comes from the fixed lift B0 uses. V3 adds 351,376
+parameters (+4.2%) and about 6% step time; the branch-only ablations run 10-25x faster
+than V0.
+
+| Experiment | Branches | Section I ablation |
+|---|---|---|
+| `V3mag` | magnitude | Magnitude only |
+| `V3rot` | rotation | Rotation only |
+| `V3magrot` | magnitude, rotation | Magnitude + Rotation |
+| `V3vcgmag` | vcg, magnitude | VCG + Magnitude |
+| `V3vcgrot` | vcg, rotation | VCG + Rotation -- read from the `V1` run, not trained |
+| `V3` | vcg, magnitude, rotation | VCG + Magnitude + Rotation |
+| `V3ctrl` | vcg, position, delta | real control: P_t and P_{t+1} - P_t, identical parameter count |
+
+VCG + Rotation is V1 layer for layer and parameter for parameter, so `tables` reports the
+V1 run under both names and `train` refuses to run it twice.
+
+```bash
+python -m qlvcg train --experiment V3
+python -m qlvcg train --experiment V3mag
+python -m qlvcg train --experiment V3rot
+python -m qlvcg train --experiment V3magrot
+python -m qlvcg train --experiment V3vcgmag
+python -m qlvcg tables --root runs
 ```
 
 Each `train` evaluates the validation-selected checkpoint on fold 10 once and appends a
@@ -466,5 +492,5 @@ qdg/interpret.py      perturbation contributions on R-peak-relative time
 qdg/delineate.py      per-beat QRS onset/offset and T peak/end, with QC flags
 qdg/phases.py         contributions mapped onto DEP and REP, tables and the main figure
 lvcg/                 the author's LVCG release, vendored; lvcg/data reconstructed
-qlvcg/                B0, V0, V1, V2 supervised on PTB-XL, quaternion utilities, CLI
+qlvcg/                B0, V0, V1-V3 supervised on PTB-XL, quaternion utilities, CLI
 ```

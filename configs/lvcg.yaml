@@ -63,20 +63,14 @@ model:
     sign_continuity: true
     include_magnitude: false
     include_linear_velocity: false
-protocol:
-  # The V0A/V0B winner's objective, fixed for V1-V8 (master prompt section E):
-  # classification | classification+auxiliary. Left null on purpose: V1-V8 refuse to
-  # train until V0 has been compared and this line is filled in.
-  objective: null
-objective:
-  # V0-B only. Auxiliary weights are the author's; lambda_cls is not in the author's
-  # config (it had no classifier) and is 1.
-  lambda_cls: 1.0
-  lambda_ecg: 1.0
-  lambda_beat: 1.0
-  lambda_base: 1.0
-  lambda_temporal: 0.1
-  num_visible: 3
+  # V3 MRQ-LVCG: magnitude and rotation branches beside, or instead of, the LVCG branch.
+  mrq_lvcg:
+    embedding_dim: 128
+    hidden: 64
+    kernel: 7
+    dropout: 0.1
+    min_magnitude_fraction: 0.02
+    sign_continuity: true
 training:
   seed: 42
   epochs: 50

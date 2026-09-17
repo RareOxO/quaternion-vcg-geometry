@@ -8,7 +8,7 @@ from qdg.data import PTBXLDataset, load_manifest, prepare
 
 from .config import DEFAULT_CONFIG, load_config
 from .engine import check_cache, evaluate, train
-from .models import EXPERIMENTS, FROM_PROTOCOL, build_model, record_shapes, standardize
+from .models import EXPERIMENTS, build_model, record_shapes, standardize
 from .tables import write_history
 
 
@@ -21,9 +21,6 @@ def profile(config, experiment):
     dataset = PTBXLDataset(config["data"]["cache"], "train")
     ecg = standardize(torch.stack([dataset[i]["ecg"] for i in range(4)]))
     spec = EXPERIMENTS[experiment]
-    objective = spec["objective"]
-    if objective == FROM_PROTOCOL:
-        objective = config["protocol"]["objective"] or "not selected yet (set protocol.objective)"
     return {
         "experiment": experiment,
         "task": "PTB-XL diagnostic superclass, multi-label",
@@ -36,12 +33,11 @@ def profile(config, experiment):
         },
         "ecg_to_vcg": "Tikhonov pseudo-inverse of the paper's Table 7 lead directions, eps 0.1",
         "model": spec["model"],
-        "objective": objective,
+        "objective": "classification",
         "features": list(getattr(getattr(model, "dynamics", None), "features", ())) or None,
         "tensor_shapes": record_shapes(model, ecg),
         "parameters": model.parameter_counts(),
-        "loss": "BCEWithLogitsLoss (no positive weighting)"
-        + (" + author auxiliary losses" if objective == "classification+auxiliary" else ""),
+        "loss": "BCEWithLogitsLoss (no positive weighting)",
         "optimizer": "AdamW",
         "lr": tc["lr"],
         "weight_decay": tc["weight_decay"],
@@ -60,8 +56,11 @@ def main():
     for name in ("prepare", "profile", "sanity", "train", "evaluate", "tables"):
         sub = commands.add_parser(name)
         sub.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-        if name in ("profile", "train"):
+        if name == "profile":
             sub.add_argument("--experiment", choices=list(EXPERIMENTS), required=True)
+        if name == "train":
+            trainable = [n for n, spec in EXPERIMENTS.items() if not spec.get("reuses")]
+            sub.add_argument("--experiment", choices=trainable, required=True)
         if name == "train":
             sub.add_argument("--seed", type=int)
             sub.add_argument("--run-name")
@@ -69,11 +68,9 @@ def main():
             sub.add_argument("--device")
             sub.add_argument("--limit-train", type=int)
             sub.add_argument("--limit-val", type=int)
-            sub.add_argument(
-                "--objective",
-                choices=("classification", "classification+auxiliary"),
-                help="V1-V8 only: the objective V0 selected, overriding protocol.objective",
-            )
+            # Accepted so commands written before V0 became classification-only still run;
+            # classification is the only objective.
+            sub.add_argument("--objective", choices=("classification",), help=argparse.SUPPRESS)
         if name == "evaluate":
             sub.add_argument("--checkpoint", type=Path, required=True)
             sub.add_argument("--split", choices=("val", "test"), default="test")
@@ -97,8 +94,6 @@ def main():
             config["training"]["seed"] = args.seed
         if args.device:
             config["training"]["device"] = args.device
-        if args.objective:
-            config.setdefault("protocol", {})["objective"] = args.objective
         run_dir = train(
             config,
             args.experiment,

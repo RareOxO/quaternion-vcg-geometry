@@ -33,14 +33,7 @@ from qdg.engine import make_loader, setup
 from qdg.metrics import validation_thresholds
 
 from .metrics import full_metrics
-from .models import (
-    EXPERIMENTS,
-    FROM_PROTOCOL,
-    OBJECTIVES,
-    build_model,
-    record_shapes,
-    standardize,
-)
+from .models import EXPERIMENTS, LEGACY_NAMES, build_model, record_shapes, standardize
 
 CSV_COLUMNS = (
     "experiment",
@@ -72,21 +65,6 @@ def warmup_cosine(warmup_steps, total_steps):
     return factor
 
 
-def resolve_objective(config, experiment):
-    """The objective an experiment trains with; V1-V8 take V0's selected one."""
-    objective = EXPERIMENTS[experiment]["objective"]
-    if objective != FROM_PROTOCOL:
-        return objective
-    selected = config.get("protocol", {}).get("objective")
-    if selected not in OBJECTIVES:
-        raise ValueError(
-            f"{experiment} trains with the objective V0 selected, and none is recorded yet. "
-            "Compare V0A and V0B, then set protocol.objective in configs/lvcg.yaml "
-            "(or pass --objective)."
-        )
-    return selected
-
-
 def check_cache(manifest, config):
     stats, lvcg = manifest["stats"], config["model"]["lvcg"]
     if stats["sampling_rate"] != lvcg["fs"] or stats["signal_length"] != lvcg["time_len"]:
@@ -96,39 +74,24 @@ def check_cache(manifest, config):
         )
 
 
-def train_epoch(model, loader, optimizer, scheduler, device, config, auxiliary):
+def train_epoch(model, loader, optimizer, scheduler, device, config):
     model.train()
-    tc, objective = config["training"], config["objective"]
-    totals, count = {}, 0
+    tc = config["training"]
+    total, count = 0.0, 0
     for batch in tqdm(loader, desc="Train", leave=False):
         ecg = standardize(batch["ecg"].to(device, non_blocking=True))
         target = batch["target"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        terms = {"cls": F.binary_cross_entropy_with_logits(model(ecg), target)}
-        loss = terms["cls"]
-        if auxiliary:
-            terms.update(model.auxiliary_losses(ecg, objective["num_visible"]))
-            loss = (
-                objective["lambda_cls"] * terms["cls"]
-                + objective["lambda_ecg"] * terms["ecg"]
-                + objective["lambda_beat"] * terms["beat"]
-                + objective["lambda_base"] * terms["base"]
-                + objective["lambda_temporal"] * terms["temporal"]
-            )
+        loss = F.binary_cross_entropy_with_logits(model(ecg), target)
         if not torch.isfinite(loss):
-            raise FloatingPointError(
-                f"Nonfinite training loss: { {k: v.item() for k, v in terms.items()} }"
-            )
+            raise FloatingPointError("Nonfinite training loss")
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), tc["gradient_clip"])
         optimizer.step()
         scheduler.step()
-        size = len(ecg)
-        terms["total"] = loss
-        for key, value in terms.items():
-            totals[key] = totals.get(key, 0.0) + value.item() * size
-        count += size
-    return {key: value / count for key, value in totals.items()}
+        total += loss.item() * len(ecg)
+        count += len(ecg)
+    return total / count
 
 
 @torch.inference_mode()
@@ -153,6 +116,11 @@ def predict(model, loader, device):
 
 def train(config, experiment, run_name=None, limit_train=None, limit_val=None, epochs=None):
     spec = EXPERIMENTS[experiment]
+    if spec.get("reuses"):
+        raise ValueError(
+            f"{experiment} is the same configuration as {spec['reuses']}; its results are read "
+            f"from the {spec['reuses']} run, so it is not trained again."
+        )
     tc = config["training"]
     if epochs is not None:
         tc["epochs"] = epochs
@@ -160,8 +128,6 @@ def train(config, experiment, run_name=None, limit_train=None, limit_val=None, e
     check_cache(manifest, config)
     device = setup(tc)
     model = build_model(config, experiment).to(device)
-    objective = resolve_objective(config, experiment)
-    auxiliary = objective == "classification+auxiliary"
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     generator = torch.Generator().manual_seed(tc["seed"])
     train_set = PTBXLDataset(config["data"]["cache"], "train", limit_train, tc["seed"])
@@ -185,7 +151,7 @@ def train(config, experiment, run_name=None, limit_train=None, limit_val=None, e
         "run_dir": str(run_dir),
         "experiment": experiment,
         **spec,
-        "objective": objective,
+        "objective": "classification",
         "seed": tc["seed"],
         "parameters": model.parameter_counts(),
         "tensor_shapes": record_shapes(model, sample.to(device)),
@@ -206,7 +172,7 @@ def train(config, experiment, run_name=None, limit_train=None, limit_val=None, e
         if stale >= tc["patience"]:
             break
         started = time.perf_counter()
-        losses = train_epoch(model, train_loader, optimizer, scheduler, device, config, auxiliary)
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, config)
         predictions = predict(model, val_loader, device)
         metrics = full_metrics(predictions["targets"], predictions["probabilities"])
         score = metrics["macro_auroc"]
@@ -241,7 +207,7 @@ def train(config, experiment, run_name=None, limit_train=None, limit_val=None, e
             )
         log = {
             "epoch": epoch + 1,
-            **{f"train_{key}": value for key, value in losses.items()},
+            "train_loss": train_loss,
             "val_loss": predictions["loss"],
             "val_macro_auroc": score,
             "val_micro_auroc": metrics["micro_auroc"],
@@ -265,7 +231,8 @@ def train(config, experiment, run_name=None, limit_train=None, limit_val=None, e
 def evaluate(checkpoint_path, split="test", device=None, limit=None):
     checkpoint_path = Path(checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config, experiment = checkpoint["config"], checkpoint["experiment"]
+    config = checkpoint["config"]
+    experiment = LEGACY_NAMES.get(checkpoint["experiment"], checkpoint["experiment"])
     tc = dict(config["training"], device=device or config["training"]["device"])
     torch_device = setup(tc)
     manifest = load_manifest(config["data"])

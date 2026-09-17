@@ -1,7 +1,12 @@
 """reports/EXPERIMENT_HISTORY.md, regenerated from the run directories.
 
-Numbers only, and the V0 protocol-selection rule applied mechanically. Interpretation
-belongs in the per-stage reports, written after the numbers exist.
+Numbers only. Interpretation belongs in the per-stage reports, written after the
+numbers exist.
+
+Who is compared with whom: V0 against B0; every Quaternion variant against V0; and from
+V2 on, also against V1, which section H names as the key comparison. An experiment
+whose configuration is identical to an earlier one declares ``reuses`` in the registry
+and is read from that run rather than trained twice.
 """
 
 import json
@@ -9,9 +14,10 @@ from pathlib import Path
 
 from qdg.data import CLASSES
 
-from .models import EXPERIMENTS
+from .models import EXPERIMENTS, LEGACY_NAMES
 
 ORDER = tuple(EXPERIMENTS)
+METRICS = ("macro_auroc", "micro_auroc", "macro_f1", "micro_f1")
 
 
 def collect(root):
@@ -19,11 +25,15 @@ def collect(root):
     runs = {}
     for path in sorted(Path(root).rglob("best_test_metrics.json")):
         result = json.loads(path.read_text())
-        if result.get("experiment") not in EXPERIMENTS:
+        name = LEGACY_NAMES.get(result.get("experiment"), result.get("experiment"))
+        if name not in EXPERIMENTS or EXPERIMENTS[name].get("reuses"):
             continue
         if result["smoke_training"] or result["limited_evaluation"]:
             continue
-        runs.setdefault(result["experiment"], []).append((path.parent, result))
+        runs.setdefault(name, []).append((path.parent, result))
+    for name, spec in EXPERIMENTS.items():
+        if spec.get("reuses") in runs:
+            runs[name] = runs[spec["reuses"]]
     return runs
 
 
@@ -37,12 +47,13 @@ def _table(header, rows):
     return "\n".join(lines)
 
 
-def select_v0(results):
-    """Master prompt section E: V0-A or V0-B, by validation macro AUROC, fixed thereafter."""
-    if "V0A" not in results or "V0B" not in results:
-        return None
-    score = {name: results[name]["validation_macro_auroc"] for name in ("V0A", "V0B")}
-    return max(score, key=score.get), score
+def _baseline(name, results):
+    """(label, result) this experiment's per-label deltas are taken against."""
+    if name == "B0":
+        return None, None
+    if name == "V0":
+        return "B0", results.get("B0")
+    return "V0", results.get("V0")
 
 
 def write_history(root, reports):
@@ -50,13 +61,15 @@ def write_history(root, reports):
     # One seed per experiment at this stage; the latest run of each is reported.
     latest = {name: runs[name][-1] for name in ORDER if name in runs}
     results = {name: result for name, (_, result) in latest.items()}
+
     overall = []
     for name, (run_dir, result) in latest.items():
         test = result["fixed_0.5"]
         seconds = json.loads((run_dir / "training_time.json").read_text())["seconds"]
+        reused = EXPERIMENTS[name].get("reuses")
         overall.append(
             [
-                name,
+                name if not reused else f"{name} (= {reused})",
                 EXPERIMENTS[name]["variant"],
                 result["seed"],
                 f"{result['parameters']['total']:,}",
@@ -65,10 +78,7 @@ def write_history(root, reports):
                 _f(result["validation_macro_auroc"]),
                 _f(result["validation_loss"]),
                 _f(result["test_loss"]),
-                _f(test["macro_auroc"]),
-                _f(test["micro_auroc"]),
-                _f(test["macro_f1"]),
-                _f(test["micro_f1"]),
+                *[_f(test[key]) for key in METRICS],
                 f"{seconds / 60:.1f}",
             ]
         )
@@ -76,8 +86,9 @@ def write_history(root, reports):
         "# Experiment history",
         "",
         "PTB-XL superclass task (5 labels, multi-label), official folds 1-8 / 9 / 10,",
-        "trained from scratch end to end. Test metrics at a fixed 0.5 threshold; F1 at",
-        "validation-selected thresholds is in each run's best_test_metrics.json.",
+        "trained from scratch end to end with the classification loss only. Test metrics at a",
+        "fixed 0.5 threshold; F1 at validation-selected thresholds is in each run's",
+        "best_test_metrics.json.",
         "",
         "## Overall",
         "",
@@ -101,46 +112,35 @@ def write_history(root, reports):
             overall,
         ),
     ]
-    chosen = select_v0(results)
-    reference = results[chosen[0]] if chosen else None
-    if results:
-        # V0A and V0B are measured against B0; everything after V0 against the V0 run
-        # whose objective was selected.
-        def baseline(name):
-            if name == "B0":
-                return None, None
-            if name in ("V0A", "V0B"):
-                return "B0", results.get("B0")
-            return "V0", reference
 
+    if results:
         header, rows = ["Label"], []
         for name in results:
             header += [f"{name} AUROC", f"{name} F1"]
-            label, ref = baseline(name)
-            if ref is not None:
+            label, reference = _baseline(name, results)
+            if reference is not None:
                 header += [f"{name} dAUROC vs {label}", f"{name} dF1 vs {label}"]
         for cls_name in CLASSES:
             row = [cls_name]
             for name in results:
                 cls = results[name]["fixed_0.5"]["per_class"][cls_name]
                 row += [_f(cls["auroc"]), _f(cls["f1"])]
-                _, ref = baseline(name)
-                if ref is not None:
-                    other = ref["fixed_0.5"]["per_class"][cls_name]
+                _, reference = _baseline(name, results)
+                if reference is not None:
+                    other = reference["fixed_0.5"]["per_class"][cls_name]
                     row += [
                         f"{cls['auroc'] - other['auroc']:+.4f}",
                         f"{cls['f1'] - other['f1']:+.4f}",
                     ]
             rows.append(row)
         text += ["", "## Per label", "", _table(header, rows)]
-    later = [name for name in results if name not in ("B0", "V0A", "V0B")]
-    if reference is not None and later:
-        v0_params = reference["parameters"]["total"]
-        v1 = results.get("V1")
+
+    v0, v1 = results.get("V0"), results.get("V1")
+    later = [name for name in results if name not in ("B0", "V0")]
+    if v0 is not None and later:
         rows = []
         for name in later:
-            test, ref = results[name]["fixed_0.5"], reference["fixed_0.5"]
-            # Section H's key comparison is V2 against V1 as well as against V0.
+            test, reference = results[name]["fixed_0.5"], v0["fixed_0.5"]
             against_v1 = (
                 f"{test['macro_auroc'] - v1['fixed_0.5']['macro_auroc']:+.4f}"
                 if v1 is not None and not name.startswith("V1")
@@ -148,15 +148,15 @@ def write_history(root, reports):
             )
             rows.append(
                 [name, EXPERIMENTS[name]["variant"]]
+                + [f"{test[key] - reference[key]:+.4f}" for key in METRICS]
                 + [
-                    f"{test[key] - ref[key]:+.4f}"
-                    for key in ("macro_auroc", "micro_auroc", "macro_f1", "micro_f1")
+                    against_v1,
+                    f"{results[name]['parameters']['total'] - v0['parameters']['total']:+,}",
                 ]
-                + [against_v1, f"{results[name]['parameters']['total'] - v0_params:+,}"]
             )
         text += [
             "",
-            f"## Against V0 ({chosen[0]})",
+            "## Against V0",
             "",
             _table(
                 [
@@ -172,16 +172,7 @@ def write_history(root, reports):
                 rows,
             ),
         ]
-    if chosen:
-        protocol, score = chosen
-        text += [
-            "",
-            "## V0 protocol selection",
-            "",
-            f"Validation macro AUROC: V0A {score['V0A']:.4f}, V0B {score['V0B']:.4f}. "
-            f"Rule: the higher validation score is fixed as the V1-V8 protocol -> **{protocol}**. "
-            "Training stability is read from each run's history.jsonl before confirming.",
-        ]
+
     path = Path(reports) / "EXPERIMENT_HISTORY.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(text) + "\n", encoding="utf-8")

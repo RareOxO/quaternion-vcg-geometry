@@ -1,4 +1,4 @@
-"""B0, V0 and the shared supervised protocol."""
+"""B0, V0, the Quaternion-LVCG variants and the shared supervised protocol."""
 
 import csv
 import json
@@ -11,12 +11,13 @@ import torch
 from lvcg.models import LVCG
 from qdg.data import CLASSES
 from qlvcg.config import DEFAULT_CONFIG, load_config, validate_config
-from qlvcg.engine import CSV_COLUMNS, resolve_objective, train, warmup_cosine
+from qlvcg.engine import CSV_COLUMNS, evaluate, train, warmup_cosine
 from qlvcg.models import (
     EXPERIMENTS,
     LVCG_RECONSTRUCTION_ONLY,
     QDFLVCG,
     QDTLVCG,
+    MRQLVCG,
     BeatQuaternionFeatures,
     SupervisedLVCG,
     build_model,
@@ -69,14 +70,14 @@ def test_warmup_then_cosine_to_zero():
     assert factor(110) == pytest.approx(0.0, abs=1e-9)
 
 
-@pytest.mark.parametrize("experiment", ["B0", "V0A", "V0B"])
+@pytest.mark.parametrize("experiment", ["B0", "V0"])
 def test_logits_are_multilabel_and_finite(config, experiment):
     model = build_model(config, experiment)
     logits = model(_ecg())
     assert logits.shape == (3, len(CLASSES)) and torch.isfinite(logits).all()
 
 
-@pytest.mark.parametrize("experiment", ["B0", "V0A"])
+@pytest.mark.parametrize("experiment", ["B0", "V0"])
 def test_no_quaternion_component(config, experiment):
     assert not any("quat" in name for name in _names(build_model(config, experiment)))
 
@@ -90,20 +91,20 @@ def test_b0_has_no_lvcg_machinery(config):
 def test_b0_sees_exactly_the_vcg_v0_sees(config):
     """Same geometry, same pseudo-inverse, same eps: the B0/V0 gap is the architecture."""
     ecg = _ecg()
-    b0, v0 = build_model(config, "B0"), build_model(config, "V0A")
+    b0, v0 = build_model(config, "B0"), build_model(config, "V0")
     torch.testing.assert_close(
         b0.vcg(ecg), v0.backbone._recover_vcg(ecg, torch.arange(12).expand(3, -1))
     )
 
 
 def test_v0_is_the_unmodified_author_class(config):
-    model = build_model(config, "V0A")
+    model = build_model(config, "V0")
     assert isinstance(model, SupervisedLVCG) and type(model.backbone) is LVCG
 
 
 def test_classification_gradients_skip_exactly_the_reconstruction_modules(config):
     """What `parameter_counts()['classification_path']` claims, checked by autograd."""
-    model = build_model(config, "V0A")
+    model = build_model(config, "V0")
     model(_ecg()).sum().backward()
     for name, module in model.backbone.named_children():
         grads = [p.grad for p in module.parameters()]
@@ -117,19 +118,8 @@ def test_classification_gradients_skip_exactly_the_reconstruction_modules(config
     assert counts["total"] > counts["classification_path"]
 
 
-def test_auxiliary_objective_trains_the_decoders(config):
-    torch.manual_seed(0)
-    model = build_model(config, "V0B")
-    terms = model.auxiliary_losses(_ecg(4), num_visible=3)
-    assert set(terms) == {"ecg", "temporal", "beat", "base"}
-    assert all(torch.isfinite(v) for v in terms.values())
-    sum(terms.values()).backward()
-    assert any(p.grad is not None for p in model.backbone.beat_decoder.parameters())
-    assert any(p.grad is not None for p in model.backbone.ecg_decoder.parameters())
-
-
 def test_record_shapes_reports_every_stage(config):
-    shapes = record_shapes(build_model(config, "V0A"), _ecg())
+    shapes = record_shapes(build_model(config, "V0"), _ecg())
     assert shapes["vcg (vcg_inverse)"] == [[3, 3, 1000]]
     beats = shapes["beats, rr, mask (beat_segmenter)"]
     assert beats[0][0] == 3 and beats[0][2:] == [3, 128]
@@ -156,7 +146,7 @@ def _smoke_config(synthetic_cache, tmp_path):
 
 def test_end_to_end_training_writes_results_and_history(synthetic_cache, tmp_path):
     config = _smoke_config(synthetic_cache, tmp_path)
-    for experiment in ("B0", "V0A", "V0B"):
+    for experiment in ("B0", "V0"):
         run_dir = train(json.loads(json.dumps(config)), experiment)
         for name in ("best.pt", "history.jsonl", "environment.json", "best_test_metrics.json"):
             assert (run_dir / name).exists(), (experiment, name)
@@ -164,14 +154,30 @@ def test_end_to_end_training_writes_results_and_history(synthetic_cache, tmp_pat
         for key in ("macro_auroc", "micro_auroc", "macro_f1", "micro_f1"):
             assert np.isfinite(result["fixed_0.5"][key])
         history = json.loads((run_dir / "history.jsonl").read_text().splitlines()[0])
-        if experiment == "V0B":
-            assert {"train_ecg", "train_temporal", "train_beat", "train_base"} <= set(history)
+        assert "train_loss" in history
     with (tmp_path / "results" / "quaternion_experiments.csv").open() as handle:
         rows = list(csv.DictReader(handle))
-    assert [row["experiment"] for row in rows] == ["B0", "V0A", "V0B"]
+    assert [row["experiment"] for row in rows] == ["B0", "V0"]
     assert tuple(rows[0]) == CSV_COLUMNS
     text = write_history(tmp_path / "runs", tmp_path / "reports").read_text()
-    assert "V0 protocol selection" in text and "V0B dAUROC vs B0" in text
+    assert "V0 dAUROC vs B0" in text and "selection" not in text
+
+
+def test_runs_saved_as_v0a_are_read_as_v0(synthetic_cache, tmp_path):
+    """Runs from before V0 became a single baseline must keep counting, and keep loading."""
+    config = _smoke_config(synthetic_cache, tmp_path)
+    run_dir = train(json.loads(json.dumps(config)), "V0")
+    for name in ("best_test_metrics.json",):
+        path = run_dir / name
+        path.write_text(path.read_text().replace('"experiment": "V0"', '"experiment": "V0A"'))
+    checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+    checkpoint["experiment"] = "V0A"
+    torch.save(checkpoint, run_dir / "best.pt")
+    run_dir.rename(run_dir.with_name("V0A_seed42"))
+    legacy = run_dir.with_name("V0A_seed42")
+    assert evaluate(legacy / "best.pt", device="cpu")["experiment"] == "V0"
+    text = write_history(tmp_path / "runs", tmp_path / "reports").read_text()
+    assert "| V0 | lvcg |" in text
 
 
 def test_smoke_runs_never_reach_the_results_csv(synthetic_cache, tmp_path):
@@ -210,7 +216,7 @@ def test_v1_logits_and_gradients_are_finite(config, experiment):
 def test_v1_keeps_the_v0_model_intact(config):
     """Section G: the V0 branch is untouched; V1 only adds beside it."""
     torch.manual_seed(0)
-    v0 = build_model(config, "V0A")
+    v0 = build_model(config, "V0")
     torch.manual_seed(0)
     v1 = build_model(config, "V1")
     assert isinstance(v1, QDFLVCG) and type(v1.backbone) is LVCG
@@ -264,26 +270,10 @@ def test_optional_features_extend_the_quaternion_sets_only(config):
 def test_real_control_is_parameter_matched(config):
     quaternion = build_model(config, "V1").parameter_counts()
     control = build_model(config, "V1ctrl").parameter_counts()
-    v0 = build_model(config, "V0A").parameter_counts()["total"]
+    v0 = build_model(config, "V0").parameter_counts()["total"]
     assert quaternion["total"] - v0 == quaternion["dynamic_branch"]
     gap = abs(control["dynamic_branch"] - quaternion["dynamic_branch"])
     assert gap / quaternion["dynamic_branch"] < 0.02
-
-
-def test_v1_will_not_train_before_v0_selects_its_objective(config):
-    assert config["protocol"]["objective"] is None
-    with pytest.raises(ValueError, match="V0 selected"):
-        resolve_objective(config, "V1")
-    config["protocol"]["objective"] = "classification+auxiliary"
-    assert resolve_objective(config, "V1") == "classification+auxiliary"
-    assert resolve_objective(config, "V0A") == "classification"
-
-
-def test_v1_auxiliary_objective_still_trains_the_backbone(config):
-    torch.manual_seed(0)
-    model = build_model(config, "V1")
-    terms = model.auxiliary_losses(_ecg(4), num_visible=3)
-    assert all(torch.isfinite(v) for v in terms.values())
 
 
 def test_v1_shapes_are_recorded(config):
@@ -295,10 +285,8 @@ def test_v1_shapes_are_recorded(config):
 
 def test_v1_end_to_end_and_history_against_v0(synthetic_cache, tmp_path):
     config = _smoke_config(synthetic_cache, tmp_path)
-    for experiment in ("B0", "V0A", "V0B"):
-        train(json.loads(json.dumps(config)), experiment)
-    config["protocol"]["objective"] = "classification"
-    run_dir = train(json.loads(json.dumps(config)), "V1")
+    for experiment in ("B0", "V0", "V1"):
+        run_dir = train(json.loads(json.dumps(config)), experiment)
     environment = json.loads((run_dir / "environment.json").read_text())
     assert environment["objective"] == "classification"
     train(json.loads(json.dumps(config)), "V2")
@@ -306,6 +294,9 @@ def test_v1_end_to_end_and_history_against_v0(synthetic_cache, tmp_path):
     assert "V1 dAUROC vs V0" in text and "## Against V0" in text
     v2_row = next(line for line in text.splitlines() if line.startswith("| V2 | qdt_lvcg |"))
     assert v2_row.split("|")[7].strip() != "-", "V2 must be compared with V1"
+    v1_row = next(line for line in text.splitlines() if line.startswith("| V1 | qdf_lvcg | 42"))
+    reused = next(line for line in text.splitlines() if line.startswith("| V3vcgrot (= V1) |"))
+    assert v1_row.split("|")[4:] == reused.split("|")[4:], "V3 VCG+Rotation is read from V1"
 
 
 # --- V2 QDT-LVCG ---
@@ -315,7 +306,7 @@ V2_EXPERIMENTS = [name for name, spec in EXPERIMENTS.items() if spec["model"] ==
 
 def _v2_matching_v0(config, experiment):
     torch.manual_seed(0)
-    v0 = build_model(config, "V0A").eval()
+    v0 = build_model(config, "V0").eval()
     v2 = build_model(config, experiment).eval()
     v2.backbone.load_state_dict(v0.backbone.state_dict())
     return v0, v2
@@ -428,16 +419,11 @@ def test_padding_beats_never_reach_the_quaternion_encoder(config):
     assert tokens[~beat_mask].abs().max() == 0 and tokens[beat_mask].abs().sum() > 0
 
 
-def test_v2_is_classification_only(config):
-    with pytest.raises(NotImplementedError):
-        build_model(config, "V2").auxiliary_losses(_ecg(4), num_visible=3)
-
-
 def test_v2_parameters_and_shapes(config):
     v2 = build_model(config, "V2")
     assert isinstance(v2, QDTLVCG)
     counts = v2.parameter_counts()
-    v0 = build_model(config, "V0A").parameter_counts()["total"]
+    v0 = build_model(config, "V0").parameter_counts()["total"]
     assert counts["total"] - v0 == counts["dynamic_branch"]
     control = build_model(config, "V2ctrl").parameter_counts()["dynamic_branch"]
     assert abs(control - counts["dynamic_branch"]) / counts["dynamic_branch"] < 0.02
@@ -446,3 +432,108 @@ def test_v2_parameters_and_shapes(config):
     assert shapes["beat features, mask (beat_dynamics)"][0] == [3, beats[1], 7, 127]
     assert shapes["fused tokens (fusion)"] == [[3, beats[1], 256]]
     assert shapes["logits (head)"] == [[3, len(CLASSES)]]
+
+
+# --- V3 MRQ-LVCG ---
+
+V3_EXPERIMENTS = [name for name, spec in EXPERIMENTS.items() if spec["model"] == "mrq_lvcg"]
+V3_TRAINED = [name for name in V3_EXPERIMENTS if not EXPERIMENTS[name].get("reuses")]
+
+
+def test_v3_covers_the_six_section_i_ablations_and_the_control():
+    branches = {EXPERIMENTS[name]["branches"] for name in V3_EXPERIMENTS}
+    assert {
+        ("magnitude",),
+        ("rotation",),
+        ("magnitude", "rotation"),
+        ("vcg", "magnitude"),
+        ("vcg", "rotation"),
+        ("vcg", "magnitude", "rotation"),
+    } <= branches
+    assert EXPERIMENTS["V3"]["branches"] == ("vcg", "magnitude", "rotation")
+    assert EXPERIMENTS["V3ctrl"]["branches"] == ("vcg", "position", "delta")
+
+
+@pytest.mark.parametrize("experiment", V3_TRAINED)
+def test_v3_logits_and_gradients_are_finite(config, experiment):
+    torch.manual_seed(0)
+    model = build_model(config, experiment)
+    logits = model(_ecg())
+    assert logits.shape == (3, len(CLASSES)) and torch.isfinite(logits).all()
+    logits.square().mean().backward()
+    for encoder in model.branch_encoders.values():
+        assert all(
+            p.grad is not None and torch.isfinite(p.grad).all() for p in encoder.parameters()
+        )
+
+
+def test_vcg_plus_rotation_is_v1(config):
+    """The reuse is only honest if the two are the same model."""
+    v1, v3 = build_model(config, "V1"), build_model(config, "V3vcgrot")
+    assert v1.parameter_counts()["total"] == v3.parameter_counts()["total"]
+    assert (
+        v1.dynamic_encoder.net[0].num_features == v3.branch_encoders["rotation"].net[0].num_features
+    )
+    assert v1.dynamics.features == v3.branch_features["rotation"].features
+    assert v1.head.net.in_features == v3.head.net.in_features
+    ecg = _ecg()
+    features_v1, _ = v1.dynamics(v1.vcg(ecg))
+    features_v3, _ = v3.branch_features["rotation"](v3.vcg(ecg))
+    torch.testing.assert_close(features_v1, features_v3)
+
+
+def test_reused_experiments_are_not_trained(config):
+    with pytest.raises(ValueError, match="same configuration as V1"):
+        train(config, "V3vcgrot")
+
+
+def test_branches_without_vcg_carry_no_lvcg_backbone(config):
+    for name in ("V3mag", "V3rot", "V3magrot"):
+        model = build_model(config, name)
+        assert model.backbone is None
+        assert not any(type(m).__name__ == "LVCG" for m in model.modules())
+        torch.testing.assert_close(model.vcg(_ecg()), build_model(config, "B0").vcg(_ecg()))
+
+
+def test_magnitude_branch_encodes_the_norm_alone(config):
+    model = build_model(config, "V3mag")
+    vcg = model.vcg(_ecg())
+    features, _ = model.branch_features["magnitude"](vcg)
+    assert features.shape == (3, 1, 999)
+    torch.testing.assert_close(features[:, 0], vcg[..., :-1].norm(dim=1), atol=1e-5, rtol=0)
+
+
+def test_rotation_and_magnitude_factorise_the_vector(config):
+    """P_t = r_t u_t: the magnitude and the direction the rotation is built from recover P."""
+    from qlvcg.quaternion_utils import rotate_vector_by_quaternion
+
+    model = build_model(config, "V3")
+    p = model.vcg(_ecg()).transpose(1, 2)
+    r = p.norm(dim=-1, keepdim=True)
+    u = p / r
+    q, _ = model.branch_features["rotation"](p.transpose(1, 2))
+    q = q[:, :4].transpose(1, 2)
+    valid = (r[:, :-1, 0] > 0.05 * r.amax(dim=1)) & (r[:, 1:, 0] > 0.05 * r.amax(dim=1))
+    rotated = rotate_vector_by_quaternion(u[:, :-1], q)
+    torch.testing.assert_close(rotated[valid], u[:, 1:][valid], atol=1e-4, rtol=0)
+    torch.testing.assert_close(r * u, p, atol=1e-5, rtol=0)
+
+
+def test_real_control_matches_v3_parameter_for_parameter(config):
+    v3 = build_model(config, "V3").parameter_counts()
+    control = build_model(config, "V3ctrl").parameter_counts()
+    assert v3["total"] == control["total"]
+    assert (
+        v3["total"] - build_model(config, "V0").parameter_counts()["total"] == v3["dynamic_branch"]
+    )
+
+
+def test_v3_shapes_are_recorded(config):
+    shapes = record_shapes(build_model(config, "V3"), _ecg())
+    assert shapes["magnitude features, mask"][0] == [3, 1, 999]
+    assert shapes["rotation features, mask"][0] == [3, 7, 999]
+    assert shapes["e_magnitude"] == [[3, 128]] and shapes["e_rotation"] == [[3, 128]]
+    assert shapes["logits (head)"] == [[3, len(CLASSES)]]
+    only = record_shapes(build_model(config, "V3rot"), _ecg())
+    assert "vcg (lift)" in only and "beat tokens (beat_encoder)" not in only
+    assert isinstance(build_model(config, "V3"), MRQLVCG)
