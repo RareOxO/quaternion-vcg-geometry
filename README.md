@@ -338,6 +338,42 @@ python -m qlvcg train --experiment V0B
 python -m qlvcg tables --root runs           # reports/EXPERIMENT_HISTORY.md
 ```
 
+### V1 QDF-LVCG: explicit cardiac-vector rotation beside V0
+
+V1 keeps the V0 model untouched and adds a 128-d embedding e_Q computed from the same
+VCG the backbone segments. For adjacent samples (dt = 1/fs = 10 ms) it forms the
+shortest-arc rotation q_t = Rot(u_t -> u_{t+1}), its angle theta_t and angular speed
+omega_t = theta_t / dt, and encodes them with a light three-layer 1D CNN; the linear head
+reads [e_base ; e_Q]. `qlvcg/quaternion_utils.py` holds the shared quaternion algebra for
+V1-V8 (section F). A transition whose endpoints are below 2% of the record's
+99th-percentile VCG magnitude has no reliable direction and gets the identity rotation
+instead of noise; the mask is also given to the encoder. Sign continuity is enforced
+along time. V1 adds 177,038 parameters (+2.1%) and no measurable step time.
+
+| Experiment | Features | Role |
+|---|---|---|
+| `V1` | q, theta, omega | the variant |
+| `V1q`, `V1theta`, `V1omega` | one each | section G ablation (V0 is the zero point) |
+| `V1ctrl` | P_t, P_{t+1}, P_{t+1} - P_t | section O real-valued control, 0.8% parameter gap |
+
+At a fixed dt, omega is theta times a constant, and the encoder's input batch
+normalisation is scale-invariant, so `V1theta` and `V1omega` see the same input: expect
+them to differ only by noise. Section O asks for the control only once a variant shows
+promise.
+
+V1-V8 train with the objective V0 selects. `protocol.objective` in `configs/lvcg.yaml`
+is left null on purpose, and V1 refuses to train until it is set (or `--objective` is
+passed):
+
+```bash
+python -m qlvcg sanity                       # section 9 numerical checks on real records
+python -m qlvcg train --experiment V1 --objective classification   # the V0 winner's objective
+python -m qlvcg train --experiment V1q --objective classification
+python -m qlvcg train --experiment V1theta --objective classification
+python -m qlvcg train --experiment V1omega --objective classification
+python -m qlvcg train --experiment V1ctrl --objective classification
+```
+
 Each `train` evaluates the validation-selected checkpoint on fold 10 once and appends a
 row to `results/quaternion_experiments.csv`. Runs limited with `--limit-train` /
 `--limit-val` never reach that file.
@@ -400,5 +436,5 @@ qdg/interpret.py      perturbation contributions on R-peak-relative time
 qdg/delineate.py      per-beat QRS onset/offset and T peak/end, with QC flags
 qdg/phases.py         contributions mapped onto DEP and REP, tables and the main figure
 lvcg/                 the author's LVCG release, vendored; lvcg/data reconstructed
-qlvcg/                B0 and V0 supervised on PTB-XL, shared protocol and CLI
+qlvcg/                B0, V0 and V1 supervised on PTB-XL, quaternion utilities, CLI
 ```

@@ -40,6 +40,24 @@ model:
     channels: [32, 64, 128, 128]
     kernel: 7
     dropout: 0.1
+  # V1 QDF-LVCG: the dynamic branch added beside the untouched V0 model.
+  qdf_lvcg:
+    embedding_dim: 128
+    hidden: 64
+    kernel: 7
+    dropout: 0.1
+    # A transition is undefined when an endpoint is below this fraction of the record's
+    # 99th-percentile VCG magnitude (see qlvcg.quaternion_utils.valid_rotation_mask).
+    min_magnitude_fraction: 0.02
+    sign_continuity: true
+    # Section G's optional extras, appended to every quaternion feature set when true.
+    include_magnitude: false
+    include_linear_velocity: false
+protocol:
+  # The V0A/V0B winner's objective, fixed for V1-V8 (master prompt section E):
+  # classification | classification+auxiliary. Left null on purpose: V1-V8 refuse to
+  # train until V0 has been compared and this line is filled in.
+  objective: null
 objective:
   # V0-B only. Auxiliary weights are the author's; lambda_cls is not in the author's
   # config (it had no classifier) and is 1.

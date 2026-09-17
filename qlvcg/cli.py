@@ -8,7 +8,7 @@ from qdg.data import PTBXLDataset, load_manifest, prepare
 
 from .config import DEFAULT_CONFIG, load_config
 from .engine import check_cache, evaluate, train
-from .models import EXPERIMENTS, build_model, record_shapes, standardize
+from .models import EXPERIMENTS, FROM_PROTOCOL, build_model, record_shapes, standardize
 from .tables import write_history
 
 
@@ -21,6 +21,9 @@ def profile(config, experiment):
     dataset = PTBXLDataset(config["data"]["cache"], "train")
     ecg = standardize(torch.stack([dataset[i]["ecg"] for i in range(4)]))
     spec = EXPERIMENTS[experiment]
+    objective = spec["objective"]
+    if objective == FROM_PROTOCOL:
+        objective = config["protocol"]["objective"] or "not selected yet (set protocol.objective)"
     return {
         "experiment": experiment,
         "task": "PTB-XL diagnostic superclass, multi-label",
@@ -33,11 +36,12 @@ def profile(config, experiment):
         },
         "ecg_to_vcg": "Tikhonov pseudo-inverse of the paper's Table 7 lead directions, eps 0.1",
         "model": spec["model"],
-        "objective": spec["objective"],
+        "objective": objective,
+        "features": list(getattr(getattr(model, "dynamics", None), "features", ())) or None,
         "tensor_shapes": record_shapes(model, ecg),
         "parameters": model.parameter_counts(),
         "loss": "BCEWithLogitsLoss (no positive weighting)"
-        + (" + author auxiliary losses" if spec["objective"] != "classification" else ""),
+        + (" + author auxiliary losses" if objective == "classification+auxiliary" else ""),
         "optimizer": "AdamW",
         "lr": tc["lr"],
         "weight_decay": tc["weight_decay"],
@@ -53,7 +57,7 @@ def profile(config, experiment):
 def main():
     parser = argparse.ArgumentParser(prog="qlvcg")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("prepare", "profile", "train", "evaluate", "tables"):
+    for name in ("prepare", "profile", "sanity", "train", "evaluate", "tables"):
         sub = commands.add_parser(name)
         sub.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
         if name in ("profile", "train"):
@@ -65,6 +69,11 @@ def main():
             sub.add_argument("--device")
             sub.add_argument("--limit-train", type=int)
             sub.add_argument("--limit-val", type=int)
+            sub.add_argument(
+                "--objective",
+                choices=("classification", "classification+auxiliary"),
+                help="V1-V8 only: the objective V0 selected, overriding protocol.objective",
+            )
         if name == "evaluate":
             sub.add_argument("--checkpoint", type=Path, required=True)
             sub.add_argument("--split", choices=("val", "test"), default="test")
@@ -79,11 +88,17 @@ def main():
         print(json.dumps(manifest["report"], ensure_ascii=False, indent=2))
     elif args.command == "profile":
         print(json.dumps(profile(config, args.experiment), ensure_ascii=False, indent=2))
+    elif args.command == "sanity":
+        from .sanity import run as run_sanity
+
+        print(json.dumps(run_sanity(config), ensure_ascii=False, indent=2))
     elif args.command == "train":
         if args.seed is not None:
             config["training"]["seed"] = args.seed
         if args.device:
             config["training"]["device"] = args.device
+        if args.objective:
+            config.setdefault("protocol", {})["objective"] = args.objective
         run_dir = train(
             config,
             args.experiment,

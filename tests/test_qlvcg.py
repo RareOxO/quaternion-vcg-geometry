@@ -11,9 +11,11 @@ import torch
 from lvcg.models import LVCG
 from qdg.data import CLASSES
 from qlvcg.config import DEFAULT_CONFIG, load_config, validate_config
-from qlvcg.engine import CSV_COLUMNS, train, warmup_cosine
+from qlvcg.engine import CSV_COLUMNS, resolve_objective, train, warmup_cosine
 from qlvcg.models import (
+    EXPERIMENTS,
     LVCG_RECONSTRUCTION_ONLY,
+    QDFLVCG,
     SupervisedLVCG,
     build_model,
     record_shapes,
@@ -174,3 +176,128 @@ def test_smoke_runs_never_reach_the_results_csv(synthetic_cache, tmp_path):
     config = _smoke_config(synthetic_cache, tmp_path)
     train(config, "B0", limit_train=4, limit_val=4)
     assert not Path(tmp_path / "results" / "quaternion_experiments.csv").exists()
+
+
+# --- V1 QDF-LVCG ---
+
+V1_EXPERIMENTS = [name for name, spec in EXPERIMENTS.items() if spec["model"] == "qdf_lvcg"]
+
+
+def test_v1_covers_the_section_g_ablation_and_the_control():
+    features = {name: EXPERIMENTS[name]["features"] for name in V1_EXPERIMENTS}
+    assert features["V1"] == ("q", "theta", "omega")
+    assert {features["V1q"], features["V1theta"], features["V1omega"]} == {
+        ("q",),
+        ("theta",),
+        ("omega",),
+    }
+    assert features["V1ctrl"] == ("position", "next_position", "delta")
+
+
+@pytest.mark.parametrize("experiment", V1_EXPERIMENTS)
+def test_v1_logits_and_gradients_are_finite(config, experiment):
+    torch.manual_seed(0)
+    model = build_model(config, experiment)
+    logits = model(_ecg())
+    assert logits.shape == (3, len(CLASSES)) and torch.isfinite(logits).all()
+    logits.square().mean().backward()
+    grads = [p.grad for p in model.dynamic_encoder.parameters()]
+    assert all(g is not None and torch.isfinite(g).all() for g in grads)
+
+
+def test_v1_keeps_the_v0_model_intact(config):
+    """Section G: the V0 branch is untouched; V1 only adds beside it."""
+    torch.manual_seed(0)
+    v0 = build_model(config, "V0A")
+    torch.manual_seed(0)
+    v1 = build_model(config, "V1")
+    assert isinstance(v1, QDFLVCG) and type(v1.backbone) is LVCG
+    assert v1.backbone.state_dict().keys() == v0.backbone.state_dict().keys()
+    for (name, a), b in zip(v0.backbone.state_dict().items(), v1.backbone.state_dict().values()):
+        torch.testing.assert_close(a, b, msg=name)
+    ecg = _ecg()
+    v0.eval()
+    v1.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(
+            v0.backbone.forward_inference(ecg), v1.backbone.forward_inference(ecg)
+        )
+    assert v1.head.net.in_features == v0.head.net.in_features + 128
+
+
+def test_v1_uses_the_vcg_the_backbone_segments(config):
+    model, ecg = build_model(config, "V1"), _ecg()
+    torch.testing.assert_close(model.vcg(ecg), build_model(config, "B0").vcg(ecg))
+
+
+def test_v1_feature_channels_and_masked_identity(config):
+    model = build_model(config, "V1")
+    ecg = _ecg()
+    ecg[:, :, 400:500] = 0.0  # a flat stretch: no direction to rotate
+    features, mask = model.dynamics(model.vcg(ecg))
+    assert features.shape == (3, 4 + 1 + 1 + 1, 999)
+    assert not mask[:, 405:495].any()
+    flat = features[:, :, 405:495]
+    assert torch.allclose(flat[:, 1:4], torch.zeros_like(flat[:, 1:4]))  # q_xyz
+    assert torch.allclose(flat[:, 0].abs(), torch.ones_like(flat[:, 0]))  # |q_w| = 1
+    # theta and omega carry the safe-norm floor: 2e-6 rad and 2e-4 rad/s, against a
+    # median omega of about 17.5 rad/s on real records.
+    assert flat[:, 4].abs().max() < 1e-5 and flat[:, 5].abs().max() < 1e-3
+    assert torch.equal(features[:, -1], mask.float())
+
+
+def test_omega_is_theta_over_dt(config):
+    model = build_model(config, "V1")
+    features, _ = model.dynamics(model.vcg(_ecg()))
+    torch.testing.assert_close(features[:, 5], features[:, 4] * config["model"]["lvcg"]["fs"])
+
+
+def test_optional_features_extend_the_quaternion_sets_only(config):
+    config["model"]["qdf_lvcg"].update(include_magnitude=True, include_linear_velocity=True)
+    assert build_model(config, "V1").dynamics.features[-2:] == ("magnitude", "linear_velocity")
+    control = build_model(config, "V1ctrl").dynamics.features
+    assert control == ("position", "next_position", "delta")
+
+
+def test_real_control_is_parameter_matched(config):
+    quaternion = build_model(config, "V1").parameter_counts()
+    control = build_model(config, "V1ctrl").parameter_counts()
+    v0 = build_model(config, "V0A").parameter_counts()["total"]
+    assert quaternion["total"] - v0 == quaternion["dynamic_branch"]
+    gap = abs(control["dynamic_branch"] - quaternion["dynamic_branch"])
+    assert gap / quaternion["dynamic_branch"] < 0.02
+
+
+def test_v1_will_not_train_before_v0_selects_its_objective(config):
+    assert config["protocol"]["objective"] is None
+    with pytest.raises(ValueError, match="V0 selected"):
+        resolve_objective(config, "V1")
+    config["protocol"]["objective"] = "classification+auxiliary"
+    assert resolve_objective(config, "V1") == "classification+auxiliary"
+    assert resolve_objective(config, "V0A") == "classification"
+
+
+def test_v1_auxiliary_objective_still_trains_the_backbone(config):
+    torch.manual_seed(0)
+    model = build_model(config, "V1")
+    terms = model.auxiliary_losses(_ecg(4), num_visible=3)
+    assert all(torch.isfinite(v) for v in terms.values())
+
+
+def test_v1_shapes_are_recorded(config):
+    shapes = record_shapes(build_model(config, "V1"), _ecg())
+    assert shapes["features, mask (dynamics)"] == [[3, 7, 999], [3, 999]]
+    assert shapes["e_Q (dynamic_encoder)"] == [[3, 128]]
+    assert shapes["logits (head)"] == [[3, len(CLASSES)]]
+
+
+def test_v1_end_to_end_and_history_against_v0(synthetic_cache, tmp_path):
+    config = _smoke_config(synthetic_cache, tmp_path)
+    for experiment in ("B0", "V0A", "V0B"):
+        train(json.loads(json.dumps(config)), experiment)
+    config["protocol"]["objective"] = "classification"
+    run_dir = train(json.loads(json.dumps(config)), "V1")
+    environment = json.loads((run_dir / "environment.json").read_text())
+    assert environment["objective"] == "classification"
+    text = write_history(tmp_path / "runs", tmp_path / "reports").read_text()
+    assert "V1 dAUROC vs V0" in text and "## Against V0" in text

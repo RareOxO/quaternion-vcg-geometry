@@ -33,7 +33,14 @@ from qdg.engine import make_loader, setup
 from qdg.metrics import validation_thresholds
 
 from .metrics import full_metrics
-from .models import EXPERIMENTS, build_model, record_shapes, standardize
+from .models import (
+    EXPERIMENTS,
+    FROM_PROTOCOL,
+    OBJECTIVES,
+    build_model,
+    record_shapes,
+    standardize,
+)
 
 CSV_COLUMNS = (
     "experiment",
@@ -63,6 +70,21 @@ def warmup_cosine(warmup_steps, total_steps):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return factor
+
+
+def resolve_objective(config, experiment):
+    """The objective an experiment trains with; V1-V8 take V0's selected one."""
+    objective = EXPERIMENTS[experiment]["objective"]
+    if objective != FROM_PROTOCOL:
+        return objective
+    selected = config.get("protocol", {}).get("objective")
+    if selected not in OBJECTIVES:
+        raise ValueError(
+            f"{experiment} trains with the objective V0 selected, and none is recorded yet. "
+            "Compare V0A and V0B, then set protocol.objective in configs/lvcg.yaml "
+            "(or pass --objective)."
+        )
+    return selected
 
 
 def check_cache(manifest, config):
@@ -138,7 +160,8 @@ def train(config, experiment, run_name=None, limit_train=None, limit_val=None, e
     check_cache(manifest, config)
     device = setup(tc)
     model = build_model(config, experiment).to(device)
-    auxiliary = spec["objective"] == "classification+auxiliary"
+    objective = resolve_objective(config, experiment)
+    auxiliary = objective == "classification+auxiliary"
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     generator = torch.Generator().manual_seed(tc["seed"])
     train_set = PTBXLDataset(config["data"]["cache"], "train", limit_train, tc["seed"])
@@ -162,6 +185,7 @@ def train(config, experiment, run_name=None, limit_train=None, limit_val=None, e
         "run_dir": str(run_dir),
         "experiment": experiment,
         **spec,
+        "objective": objective,
         "seed": tc["seed"],
         "parameters": model.parameter_counts(),
         "tensor_shapes": record_shapes(model, sample.to(device)),

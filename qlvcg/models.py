@@ -41,8 +41,21 @@ from lvcg.models.vcg import VCGPseudoInverse
 
 from qdg.data import CLASSES
 
+from .quaternion_utils import (
+    _safe_norm,
+    enforce_sign_continuity,
+    quaternion_angle,
+    valid_rotation_mask,
+    vectors_to_quaternion,
+)
+
 # The eps LVCG hard-codes for its lift; B0 must use the same one.
 LIFT_EPS = 0.1
+
+OBJECTIVES = ("classification", "classification+auxiliary")
+# V1-V8 use whichever objective won V0A vs V0B. "protocol" defers to the config, which
+# refuses to train until that choice has been recorded.
+FROM_PROTOCOL = "protocol"
 
 EXPERIMENTS = {
     "B0": {
@@ -63,6 +76,33 @@ EXPERIMENTS = {
         "variant": "lvcg_cls_aux",
         "report": "reports/V0_SUPERVISED_LVCG_report.md",
     },
+}
+_V1 = {"model": "qdf_lvcg", "objective": FROM_PROTOCOL, "report": "reports/V1_QDF_report.md"}
+EXPERIMENTS.update(
+    {
+        # The full feature set, then the section G ablation, then the section O control.
+        "V1": {**_V1, "variant": "qdf_lvcg", "features": ("q", "theta", "omega")},
+        "V1q": {**_V1, "variant": "qdf_lvcg_q", "features": ("q",)},
+        "V1theta": {**_V1, "variant": "qdf_lvcg_theta", "features": ("theta",)},
+        "V1omega": {**_V1, "variant": "qdf_lvcg_omega", "features": ("omega",)},
+        "V1ctrl": {
+            **_V1,
+            "variant": "qdf_lvcg_real_control",
+            "features": ("position", "next_position", "delta"),
+        },
+    }
+)
+QUATERNION_FEATURES = ("q", "theta", "omega", "magnitude", "linear_velocity")
+CONTROL_FEATURES = ("position", "next_position", "delta")
+FEATURE_CHANNELS = {
+    "q": 4,
+    "theta": 1,
+    "omega": 1,
+    "magnitude": 1,
+    "linear_velocity": 1,
+    "position": 3,
+    "next_position": 3,
+    "delta": 3,
 }
 # Modules the classification path of LVCG never touches. They are counted separately
 # so a parameter count does not credit V0-A with decoders it does not use.
@@ -156,11 +196,182 @@ class SupervisedLVCG(nn.Module):
         return {"total": total, "classification_path": total - unused}
 
 
+class QuaternionDynamicFeatures(nn.Module):
+    """VCG [B, 3, T] -> per-transition features [B, C, T - 1] and a validity mask.
+
+    Parameter-free. For adjacent cardiac vectors P_t, P_{t+1} (one sample apart, so
+    dt = 1 / fs):
+
+        q_t      shortest-arc rotation u_t -> u_{t+1}                   4 channels
+        theta_t  2 atan2(||q_xyz||, |q_w| + eps)                        1
+        omega_t  theta_t / dt, rad/s                                    1
+        magnitude         ||P_t||              (optional, section G)    1
+        linear_velocity   ||P_{t+1} - P_t|| / dt  (optional)            1
+
+    The real-valued control of section O replaces all of these with the raw pair and
+    its difference: P_t, P_{t+1}, P_{t+1} - P_t (3 channels each).
+
+    A transition whose endpoints are too small to carry a direction gets the identity
+    rotation -- no rotation, theta = omega = 0 -- instead of the arbitrary one noise
+    would produce; this happens before sign continuity is enforced, so the filled
+    stretch joins the sequence without a sign jump. The mask is appended as a final
+    channel for every feature set, control included, so the encoder can tell "no
+    rotation" from "rotation undefined" and both branches see the same information
+    about where the signal was too small.
+    """
+
+    def __init__(self, features, dt, min_fraction=0.02, sign_continuity=True):
+        super().__init__()
+        unknown = [f for f in features if f not in FEATURE_CHANNELS]
+        if unknown or not features:
+            raise ValueError(f"Unknown or empty feature set {features!r}")
+        if any(f in CONTROL_FEATURES for f in features) and any(
+            f in QUATERNION_FEATURES for f in features
+        ):
+            raise ValueError("A feature set is either quaternion or the real control, not both")
+        self.features = tuple(features)
+        self.dt = float(dt)
+        self.min_fraction = float(min_fraction)
+        self.sign_continuity = bool(sign_continuity)
+        self.channels = sum(FEATURE_CHANNELS[f] for f in self.features) + 1
+        self.register_buffer("identity", torch.tensor([1.0, 0.0, 0.0, 0.0]), persistent=False)
+
+    def forward(self, vcg):
+        p = vcg.transpose(1, 2)  # [B, T, 3]
+        current, following = p[:, :-1], p[:, 1:]
+        mask = valid_rotation_mask(p, lag=1, min_fraction=self.min_fraction)
+        parts = {}
+        if any(f in ("q", "theta", "omega") for f in self.features):
+            q = torch.where(
+                mask.unsqueeze(-1),
+                vectors_to_quaternion(current, following),
+                self.identity.to(p.dtype),
+            )
+            if self.sign_continuity:
+                q = enforce_sign_continuity(q)
+            theta = quaternion_angle(q).unsqueeze(-1)
+            parts.update(q=q, theta=theta, omega=theta / self.dt)
+        parts.update(
+            magnitude=_safe_norm(current, keepdim=True),
+            linear_velocity=_safe_norm(following - current, keepdim=True) / self.dt,
+            position=current,
+            next_position=following,
+            delta=following - current,
+        )
+        x = torch.cat([parts[f] for f in self.features] + [mask.unsqueeze(-1).to(p.dtype)], -1)
+        return x.transpose(1, 2), mask
+
+
+class DynamicEncoder(nn.Module):
+    """Lightweight temporal encoder, identical for the quaternion branch and its control.
+
+    Input batch normalisation puts theta (radians per step) and omega (radians per
+    second) on the same footing. It is scale-invariant, so at a fixed dt the theta-only
+    and omega-only ablations see the same input up to its epsilon: they can differ only
+    through noise, which is itself a check on the run-to-run variation.
+    """
+
+    def __init__(self, in_channels, embedding_dim=128, hidden=64, kernel=7, dropout=0.1):
+        super().__init__()
+        if kernel % 2 == 0:
+            raise ValueError("kernel must be odd")
+        layers, width = [nn.BatchNorm1d(in_channels)], in_channels
+        for out in (hidden, embedding_dim, embedding_dim):
+            layers += [
+                nn.Conv1d(width, out, kernel, stride=2, padding=kernel // 2),
+                nn.BatchNorm1d(out),
+                nn.GELU(),
+            ]
+            width = out
+        self.net = nn.Sequential(*layers)
+        self.dropout = nn.Dropout(dropout)
+        # LVCG layer-normalises each embedding part before concatenation; e_Q follows suit.
+        self.norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x):
+        return self.norm(self.dropout(self.net(x).mean(dim=-1)))
+
+
+class QDFLVCG(SupervisedLVCG):
+    """V1: the V0 model untouched, plus e_Q from explicit cardiac-vector rotation.
+
+        e_base = LVCG(ECG)                        640-d, exactly V0's embedding
+        e_Q    = DynamicEncoder(features(VCG))    128-d
+        logits = Linear([e_base ; e_Q])
+
+    The VCG is lifted with the backbone's own direction buffer and pseudo-inverse, so
+    e_Q is computed from the same VCG the backbone segments. The auxiliary losses, if
+    the V0 protocol selected them, are inherited unchanged and act on the backbone only.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        lvcg,
+        features,
+        embedding_dim=128,
+        hidden=64,
+        kernel=7,
+        dropout=0.1,
+        min_magnitude_fraction=0.02,
+        sign_continuity=True,
+    ):
+        super().__init__(num_classes, **lvcg)
+        self.dynamics = QuaternionDynamicFeatures(
+            features, 1.0 / lvcg["fs"], min_magnitude_fraction, sign_continuity
+        )
+        self.dynamic_encoder = DynamicEncoder(
+            self.dynamics.channels, embedding_dim, hidden, kernel, dropout
+        )
+        self.head = ClassificationHead(
+            "linear", self.backbone.out_features + embedding_dim, num_classes
+        )
+
+    def vcg(self, ecg):
+        directions = self.backbone.all_lead_directions.expand(ecg.shape[0], -1, -1)
+        return self.backbone.vcg_inverse(ecg, directions)
+
+    def forward(self, ecg):
+        e_base = self.backbone.forward_inference(ecg, use_all_leads=True)
+        features, _ = self.dynamics(self.vcg(ecg))
+        return self.head(torch.cat((e_base, self.dynamic_encoder(features)), dim=-1))
+
+    def parameter_counts(self):
+        counts = super().parameter_counts()
+        extra_head = self.dynamic_encoder.norm.normalized_shape[0] * self.head.net.out_features
+        counts["dynamic_branch"] = (
+            sum(p.numel() for p in self.dynamic_encoder.parameters()) + extra_head
+        )
+        return counts
+
+
 def build_model(config, experiment):
     if experiment not in EXPERIMENTS:
         raise ValueError(f"Unknown experiment {experiment!r}; expected one of {list(EXPERIMENTS)}")
     kind = EXPERIMENTS[experiment]["model"]
     settings = config["model"][kind]
+    if kind == "qdf_lvcg":
+        features = tuple(EXPERIMENTS[experiment]["features"])
+        if features[0] in QUATERNION_FEATURES:
+            features += tuple(
+                name
+                for name, flag in (
+                    ("magnitude", settings["include_magnitude"]),
+                    ("linear_velocity", settings["include_linear_velocity"]),
+                )
+                if flag
+            )
+        return QDFLVCG(
+            len(CLASSES),
+            config["model"]["lvcg"],
+            features,
+            embedding_dim=settings["embedding_dim"],
+            hidden=settings["hidden"],
+            kernel=settings["kernel"],
+            dropout=settings["dropout"],
+            min_magnitude_fraction=settings["min_magnitude_fraction"],
+            sign_continuity=settings["sign_continuity"],
+        )
     if kind == "traditional_vcg":
         return TraditionalVCG(
             len(CLASSES),
@@ -192,6 +403,9 @@ def record_shapes(model, ecg):
             "emb_rhythm (global_rr_embedding)": model.backbone.global_rr_embedding,
             "logits (head)": model.head,
         }
+        if isinstance(model, QDFLVCG):
+            stages["features, mask (dynamics)"] = model.dynamics
+            stages["e_Q (dynamic_encoder)"] = model.dynamic_encoder
     else:
         stages = {
             "vcg (lift)": model.lift,

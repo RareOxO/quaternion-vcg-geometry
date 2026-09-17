@@ -101,25 +101,69 @@ def write_history(root, reports):
             overall,
         ),
     ]
-    base = results.get("B0")
+    chosen = select_v0(results)
+    reference = results[chosen[0]] if chosen else None
     if results:
-        rows = []
-        for label in CLASSES:
-            row = [label]
-            for name in results:
-                cls = results[name]["fixed_0.5"]["per_class"][label]
-                row += [_f(cls["auroc"]), _f(cls["f1"])]
-                if name != "B0" and base is not None:
-                    ref = base["fixed_0.5"]["per_class"][label]
-                    row += [f"{cls['auroc'] - ref['auroc']:+.4f}"]
-            rows.append(row)
-        header = ["Label"]
+        # V0A and V0B are measured against B0; everything after V0 against the V0 run
+        # whose objective was selected.
+        def baseline(name):
+            if name == "B0":
+                return None, None
+            if name in ("V0A", "V0B"):
+                return "B0", results.get("B0")
+            return "V0", reference
+
+        header, rows = ["Label"], []
         for name in results:
             header += [f"{name} AUROC", f"{name} F1"]
-            if name != "B0" and base is not None:
-                header += [f"{name} dAUROC vs B0"]
+            label, ref = baseline(name)
+            if ref is not None:
+                header += [f"{name} dAUROC vs {label}", f"{name} dF1 vs {label}"]
+        for cls_name in CLASSES:
+            row = [cls_name]
+            for name in results:
+                cls = results[name]["fixed_0.5"]["per_class"][cls_name]
+                row += [_f(cls["auroc"]), _f(cls["f1"])]
+                _, ref = baseline(name)
+                if ref is not None:
+                    other = ref["fixed_0.5"]["per_class"][cls_name]
+                    row += [
+                        f"{cls['auroc'] - other['auroc']:+.4f}",
+                        f"{cls['f1'] - other['f1']:+.4f}",
+                    ]
+            rows.append(row)
         text += ["", "## Per label", "", _table(header, rows)]
-    chosen = select_v0(results)
+    later = [name for name in results if name not in ("B0", "V0A", "V0B")]
+    if reference is not None and later:
+        v0_params = reference["parameters"]["total"]
+        rows = []
+        for name in later:
+            test, ref = results[name]["fixed_0.5"], reference["fixed_0.5"]
+            rows.append(
+                [name, EXPERIMENTS[name]["variant"]]
+                + [
+                    f"{test[key] - ref[key]:+.4f}"
+                    for key in ("macro_auroc", "micro_auroc", "macro_f1", "micro_f1")
+                ]
+                + [f"{results[name]['parameters']['total'] - v0_params:+,}"]
+            )
+        text += [
+            "",
+            f"## Against V0 ({chosen[0]})",
+            "",
+            _table(
+                [
+                    "Exp",
+                    "Variant",
+                    "dMacro AUROC",
+                    "dMicro AUROC",
+                    "dMacro F1",
+                    "dMicro F1",
+                    "dParams",
+                ],
+                rows,
+            ),
+        ]
     if chosen:
         protocol, score = chosen
         text += [
