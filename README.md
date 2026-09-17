@@ -291,6 +291,64 @@ Panel A, the R-peak-relative heatmap on one symmetric scale clipped at the 99th
 percentile; Panel B, DEP against REP density per disease and branch with patient
 bootstrap intervals; Panel C, the R/L/Q composition inside each phase.
 
+## Latent VCG track: B0 and V0 (supervised PTB-XL)
+
+The second project line extends the Latent VCG framework (LVCG, ICML 2026) with
+Quaternion structure. Every model is trained from scratch, end to end, on the same PTB-XL
+superclass task -- no MIMIC-IV pretraining, no frozen linear probing.
+
+`lvcg/` is the author's release, vendored verbatim under its MIT licence
+(`lvcg/LICENSE`), with one addition: `lvcg/data/`. The public release is missing that
+directory -- its `.gitignore` lists `data/`, which also matches the source package -- so
+`import lvcg.models` fails out of the box. `lvcg/data/angle.py` holds the paper's Table 7
+lead directions, stored by lead name; `lvcg/data/beat_segmentation.py` rebuilds the
+Appendix A.4 segmenter to the contract the author's model code consumes (R-to-R
+intervals that partition the record, beat 1 the first complete beat), and the author's
+own `BeatStitcher` is used in the tests to confirm it.
+
+`qlvcg/` holds the experiments:
+
+- **B0 Traditional VCG** -- the same fixed lift as V0 (Table 7 geometry, same
+  pseudo-inverse and eps), then a small real 1D CNN, average pooling and a linear head.
+  188,741 parameters. Because the lift is identical, B0 vs V0 isolates the latent beat
+  architecture.
+- **V0 Supervised LVCG** -- the unmodified `LVCG` class with a linear head on its 640-d
+  embedding. 8,288,265 parameters, 7,296,517 of them on the classification path.
+  - **V0A** classification loss only.
+  - **V0B** adds the author's reconstruction losses with the author's weights. The masked
+    pass the auxiliary losses need lifts only three leads, so V0B runs it alongside the
+    all-lead classification pass over shared weights; the classifier input is then
+    identical in V0A and V0B.
+
+The PTB-XL split and superclass labels are the official folds used everywhere else in
+this repository, which were checked to match the LVCG/MELP benchmark split record for
+record. Preprocessing follows the paper: 100 Hz, band-pass 0.67-40 Hz, per-lead z-score.
+Training follows its Table 8 where it applies: AdamW, lr 5e-4, weight decay 0.01, batch
+64, gradient clip 1.0, 2000 warmup steps then cosine decay; 50 epochs with early
+stopping on validation macro AUROC (patience 10). The loss is plain `BCEWithLogitsLoss`.
+
+```bash
+python -m qlvcg prepare                      # 100 Hz cache, about a minute
+python -m pytest -q tests/test_lvcg_data.py tests/test_qlvcg.py
+
+python -m qlvcg profile --experiment B0      # shapes, parameters, protocol, before training
+python -m qlvcg train --experiment B0
+python -m qlvcg train --experiment V0A
+python -m qlvcg train --experiment V0B
+python -m qlvcg tables --root runs           # reports/EXPERIMENT_HISTORY.md
+```
+
+Each `train` evaluates the validation-selected checkpoint on fold 10 once and appends a
+row to `results/quaternion_experiments.csv`. Runs limited with `--limit-train` /
+`--limit-val` never reach that file.
+
+Two properties of the released LVCG code carry into V0 and are worth knowing when
+reading its numbers: the GRU rollout length is the largest beat count in the batch, so
+a record's embedding depends slightly on its batch neighbours (evaluation is unshuffled
+and reproducible); and the structural embedding is the first complete beat rather than
+the paper's mean-pooled tokens, so with the classification loss alone the morphology of
+later beats never reaches the logits; they contribute only their R-R intervals and count.
+
 ## Data
 
 PTB-XL 1.0.3 only. 12-lead, 10 s, 500 Hz, band-pass 0.5–100 Hz. Labels are the five
@@ -341,4 +399,6 @@ qdg/sanity.py         §6 checks and the numerical norm report
 qdg/interpret.py      perturbation contributions on R-peak-relative time
 qdg/delineate.py      per-beat QRS onset/offset and T peak/end, with QC flags
 qdg/phases.py         contributions mapped onto DEP and REP, tables and the main figure
+lvcg/                 the author's LVCG release, vendored; lvcg/data reconstructed
+qlvcg/                B0 and V0 supervised on PTB-XL, shared protocol and CLI
 ```

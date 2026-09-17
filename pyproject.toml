@@ -17,9 +17,10 @@ dev = ["pytest==8.4.2", "ruff==0.12.12"]
 
 [project.scripts]
 qdg = "qdg.cli:main"
+qlvcg = "qlvcg.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["qdg*"]
+include = ["qdg*", "lvcg*", "qlvcg*"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore:enable_nested_tensor:UserWarning"]
@@ -27,3 +28,5 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+# The author's LVCG release is vendored verbatim; only the reconstructed lvcg/data is ours.
+extend-exclude = ["lvcg/__init__.py", "lvcg/models", "lvcg/utils"]
