@@ -53,6 +53,16 @@ model:
     # Section G's optional extras, appended to every quaternion feature set when true.
     include_magnitude: false
     include_linear_velocity: false
+  # V2 QDT-LVCG: a quaternion token per beat, fused into the beat tokens.
+  qdt_lvcg:
+    embedding_dim: 128
+    hidden: 64
+    kernel: 7
+    dropout: 0.1
+    min_magnitude_fraction: 0.02
+    sign_continuity: true
+    include_magnitude: false
+    include_linear_velocity: false
 protocol:
   # The V0A/V0B winner's objective, fixed for V1-V8 (master prompt section E):
   # classification | classification+auxiliary. Left null on purpose: V1-V8 refuse to

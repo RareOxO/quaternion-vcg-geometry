@@ -374,6 +374,36 @@ python -m qlvcg train --experiment V1omega --objective classification
 python -m qlvcg train --experiment V1ctrl --objective classification
 ```
 
+### V2 QDT-LVCG: a quaternion token per beat
+
+V2 computes the same q, theta, omega as V1, but inside each VCG beat patch, encodes
+each real beat into a 128-d z_n^Q, and fuses it into that beat's 256-d token before the
+temporal module. `concat` (default) projects [z_n^VCG ; z_n^Q] back to 256-d; `gated`
+adds a sigmoid-gated projection of z_n^Q. Both fusions start as the identity on the VCG
+token, so an untrained V2 reproduces V0 exactly -- checked on real records. Two beat
+details: omega uses each beat's own step, dt_n = (rr_n - 1) / ((P - 1) fs), since a patch
+is a resampled R-R interval (beat-level omega on real records matches record-level:
+median 16.7 vs 17.5 rad/s); and the reliability threshold is the whole record's, so a
+quiet boundary interval is not judged against its own noise. V2 adds 274,958 parameters
+(+3.3%) and about 10% step time.
+
+| Experiment | Fusion | Features |
+|---|---|---|
+| `V2` | concat | q, theta, omega |
+| `V2gated` | gated | q, theta, omega |
+| `V2ctrl` | concat | P_t, P_{t+1}, P_{t+1} - P_t (0.5% parameter gap) |
+
+One property of the released temporal module decides what V2 can show: StateGRU does
+not read the token sequence -- it rolls out from the first complete beat's token, which
+is also the structural embedding. Only beat 1's fused token therefore reaches the logits
+(a test pins this), so V2 vs V1 compares one beat's rotation trajectory with the whole
+record's. V2 is classification-only; the author's auxiliary losses bypass the fusion.
+
+```bash
+python -m qlvcg train --experiment V2 --objective classification
+python -m qlvcg train --experiment V2gated --objective classification
+```
+
 Each `train` evaluates the validation-selected checkpoint on fold 10 once and appends a
 row to `results/quaternion_experiments.csv`. Runs limited with `--limit-train` /
 `--limit-val` never reach that file.
@@ -436,5 +466,5 @@ qdg/interpret.py      perturbation contributions on R-peak-relative time
 qdg/delineate.py      per-beat QRS onset/offset and T peak/end, with QC flags
 qdg/phases.py         contributions mapped onto DEP and REP, tables and the main figure
 lvcg/                 the author's LVCG release, vendored; lvcg/data reconstructed
-qlvcg/                B0, V0 and V1 supervised on PTB-XL, quaternion utilities, CLI
+qlvcg/                B0, V0, V1, V2 supervised on PTB-XL, quaternion utilities, CLI
 ```

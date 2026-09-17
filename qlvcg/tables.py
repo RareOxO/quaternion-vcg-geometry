@@ -136,16 +136,23 @@ def write_history(root, reports):
     later = [name for name in results if name not in ("B0", "V0A", "V0B")]
     if reference is not None and later:
         v0_params = reference["parameters"]["total"]
+        v1 = results.get("V1")
         rows = []
         for name in later:
             test, ref = results[name]["fixed_0.5"], reference["fixed_0.5"]
+            # Section H's key comparison is V2 against V1 as well as against V0.
+            against_v1 = (
+                f"{test['macro_auroc'] - v1['fixed_0.5']['macro_auroc']:+.4f}"
+                if v1 is not None and not name.startswith("V1")
+                else "-"
+            )
             rows.append(
                 [name, EXPERIMENTS[name]["variant"]]
                 + [
                     f"{test[key] - ref[key]:+.4f}"
                     for key in ("macro_auroc", "micro_auroc", "macro_f1", "micro_f1")
                 ]
-                + [f"{results[name]['parameters']['total'] - v0_params:+,}"]
+                + [against_v1, f"{results[name]['parameters']['total'] - v0_params:+,}"]
             )
         text += [
             "",
@@ -159,6 +166,7 @@ def write_history(root, reports):
                     "dMicro AUROC",
                     "dMacro F1",
                     "dMicro F1",
+                    "dMacro AUROC vs V1",
                     "dParams",
                 ],
                 rows,

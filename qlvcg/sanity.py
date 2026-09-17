@@ -73,6 +73,15 @@ def run(config, records=256):
         theta = quaternion_angle(raw)
         dt = 1.0 / lvcg["fs"]
         features, _ = model.dynamics(p.transpose(1, 2))
+        v2 = build_model(config, "V2")
+        vcg = v2.vcg(ecg)
+        backbone = v2.backbone
+        beats, rr, beat_mask = backbone.beat_segmenter(vcg, ecg, rr_lead_idx=backbone.rr_lead_idx)
+        beat_features, beat_valid = v2.beat_dynamics(beats, rr, beat_mask, vcg)
+        steps = beats.shape[-1] - 1
+        beat_dt_ms = ((rr[beat_mask] - 1).clamp_min(1.0) / (steps * lvcg["fs"])) * 1000
+        # omega is channel 5 of (q, theta, omega, mask) for the V2 feature set.
+        beat_omega = beat_features[:, :, 5][beat_valid]
     consecutive = (flipped[:, 1:] * flipped[:, :-1]).sum(-1)
     return {
         "edge_cases": _edge_cases(),
@@ -95,5 +104,15 @@ def run(config, records=256):
             ),
             "theta_deg_valid": _percentiles(torch.rad2deg(theta[mask])),
             "omega_rad_per_s_valid": _percentiles(theta[mask] / dt),
+        },
+        "beat_level_v2": {
+            "beats_shape": list(beats.shape),
+            "real_beats_per_record": _percentiles(beat_mask.float().sum(-1)),
+            "patch_step_dt_ms": _percentiles(beat_dt_ms),
+            "valid_transition_fraction_in_real_beats": round(
+                (beat_valid.sum() / (beat_mask.sum() * steps)).item(), 4
+            ),
+            "nonfinite_features": int((~torch.isfinite(beat_features)).sum()),
+            "omega_rad_per_s_valid": _percentiles(beat_omega),
         },
     }

@@ -16,6 +16,8 @@ from qlvcg.models import (
     EXPERIMENTS,
     LVCG_RECONSTRUCTION_ONLY,
     QDFLVCG,
+    QDTLVCG,
+    BeatQuaternionFeatures,
     SupervisedLVCG,
     build_model,
     record_shapes,
@@ -299,5 +301,148 @@ def test_v1_end_to_end_and_history_against_v0(synthetic_cache, tmp_path):
     run_dir = train(json.loads(json.dumps(config)), "V1")
     environment = json.loads((run_dir / "environment.json").read_text())
     assert environment["objective"] == "classification"
+    train(json.loads(json.dumps(config)), "V2")
     text = write_history(tmp_path / "runs", tmp_path / "reports").read_text()
     assert "V1 dAUROC vs V0" in text and "## Against V0" in text
+    v2_row = next(line for line in text.splitlines() if line.startswith("| V2 | qdt_lvcg |"))
+    assert v2_row.split("|")[7].strip() != "-", "V2 must be compared with V1"
+
+
+# --- V2 QDT-LVCG ---
+
+V2_EXPERIMENTS = [name for name, spec in EXPERIMENTS.items() if spec["model"] == "qdt_lvcg"]
+
+
+def _v2_matching_v0(config, experiment):
+    torch.manual_seed(0)
+    v0 = build_model(config, "V0A").eval()
+    v2 = build_model(config, experiment).eval()
+    v2.backbone.load_state_dict(v0.backbone.state_dict())
+    return v0, v2
+
+
+def test_v2_covers_section_h_and_its_control():
+    specs = {name: EXPERIMENTS[name] for name in V2_EXPERIMENTS}
+    assert specs["V2"]["fusion"] == "concat" and specs["V2gated"]["fusion"] == "gated"
+    assert specs["V2"]["features"] == EXPERIMENTS["V1"]["features"], "same features as V1"
+    assert specs["V2ctrl"]["features"] == ("position", "next_position", "delta")
+
+
+@pytest.mark.parametrize("experiment", V2_EXPERIMENTS)
+def test_untrained_v2_reproduces_v0_exactly(config, experiment):
+    """The embedding path is the author's forward_inference, and the fusion starts as identity."""
+    v0, v2 = _v2_matching_v0(config, experiment)
+    ecg = _ecg()
+    with torch.no_grad():
+        torch.testing.assert_close(v2.embed(ecg), v0.backbone.forward_inference(ecg))
+
+
+@pytest.mark.parametrize("experiment", V2_EXPERIMENTS)
+def test_v2_logits_and_gradients(config, experiment):
+    torch.manual_seed(0)
+    model = build_model(config, experiment)
+    logits = model(_ecg())
+    assert logits.shape == (3, len(CLASSES)) and torch.isfinite(logits).all()
+    logits.square().mean().backward()
+    for module in (model.quaternion_beat_encoder, model.fusion):
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in module.parameters())
+    # The zero-initialised quaternion block of the fusion learns from the first step.
+    block = (
+        model.fusion.projection.weight.grad[:, model.backbone.state_dim :]
+        if experiment != "V2gated"
+        else model.fusion.value.weight.grad
+    )
+    assert block.abs().sum() > 0
+
+
+def test_only_the_anchor_beat_token_reaches_the_embedding(config):
+    """The released StateGRU rolls out from beat 1's token and reads no other token."""
+    torch.manual_seed(0)
+    model = build_model(config, "V2").eval()
+    with torch.no_grad():
+        model.fusion.projection.weight.normal_(0, 0.05)
+    ecg = _ecg()
+    original = model.encode_beats
+
+    def embed_with_nudge(index):
+        def nudged(features, beat_mask):
+            tokens = original(features, beat_mask).clone()
+            tokens[:, index] += 3.0
+            return tokens
+
+        model.encode_beats = nudged
+        try:
+            with torch.no_grad():
+                return model.embed(ecg)
+        finally:
+            model.encode_beats = original
+
+    with torch.no_grad():
+        base = model.embed(ecg)
+    torch.testing.assert_close(embed_with_nudge(3), base)
+    assert not torch.allclose(embed_with_nudge(1), base)
+
+
+def test_beat_omega_is_a_physical_speed_whatever_the_beat_length():
+    fs, steps, omega = 100, 128, 12.0  # rad/s
+    beats, rr = [], []
+    for length in (50, 100):
+        t = torch.arange(steps) * (length - 1) / (steps - 1) / fs
+        beats.append(torch.stack((torch.cos(omega * t), torch.sin(omega * t), torch.zeros(steps))))
+        rr.append(float(length))
+    beats = torch.stack(beats)[None]  # [1, 2, 3, P]
+    features, mask = BeatQuaternionFeatures(("q", "theta", "omega"), fs)(
+        beats, torch.tensor([rr]), torch.ones(1, 2, dtype=torch.bool), torch.ones(1, 3, 500)
+    )
+    assert mask.all()
+    measured = features[0, :, 5]  # omega channel
+    torch.testing.assert_close(measured, torch.full_like(measured, omega), rtol=1e-3, atol=1e-3)
+    theta = features[0, :, 4].mean(-1)
+    assert theta[1] / theta[0] == pytest.approx(99 / 49, rel=1e-3), "theta per step is not"
+
+
+def test_beat_mask_uses_the_record_reference(config):
+    """A quiet boundary interval must not call its own noise reliable."""
+    beats = torch.ones(1, 2, 3, 128)
+    beats[:, 0] *= 1e-3  # a quiet interval in a loud record
+    vcg = torch.ones(1, 3, 1000)
+    features, mask = BeatQuaternionFeatures(("q",), 100)(
+        beats, torch.tensor([[90.0, 90.0]]), torch.ones(1, 2, dtype=torch.bool), vcg
+    )
+    assert not mask[0, 0].any() and mask[0, 1].all()
+
+
+def test_padding_beats_never_reach_the_quaternion_encoder(config):
+    model = build_model(config, "V2").train()
+    features = torch.randn(2, 4, model.beat_dynamics.channels, 127)
+    beat_mask = torch.tensor([[True, True, False, False], [True, True, True, False]])
+    seen = []
+    handle = model.quaternion_beat_encoder.register_forward_hook(
+        lambda module, inputs, output: seen.append(inputs[0].shape[0])
+    )
+    try:
+        tokens = model.encode_beats(features, beat_mask)
+    finally:
+        handle.remove()
+    assert seen == [5]
+    assert tokens[~beat_mask].abs().max() == 0 and tokens[beat_mask].abs().sum() > 0
+
+
+def test_v2_is_classification_only(config):
+    with pytest.raises(NotImplementedError):
+        build_model(config, "V2").auxiliary_losses(_ecg(4), num_visible=3)
+
+
+def test_v2_parameters_and_shapes(config):
+    v2 = build_model(config, "V2")
+    assert isinstance(v2, QDTLVCG)
+    counts = v2.parameter_counts()
+    v0 = build_model(config, "V0A").parameter_counts()["total"]
+    assert counts["total"] - v0 == counts["dynamic_branch"]
+    control = build_model(config, "V2ctrl").parameter_counts()["dynamic_branch"]
+    assert abs(control - counts["dynamic_branch"]) / counts["dynamic_branch"] < 0.02
+    shapes = record_shapes(v2, _ecg())
+    beats = shapes["beats, rr, mask (beat_segmenter)"][0]
+    assert shapes["beat features, mask (beat_dynamics)"][0] == [3, beats[1], 7, 127]
+    assert shapes["fused tokens (fusion)"] == [[3, beats[1], 256]]
+    assert shapes["logits (head)"] == [[3, len(CLASSES)]]

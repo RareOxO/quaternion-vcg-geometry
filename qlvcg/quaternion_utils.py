@@ -125,7 +125,7 @@ def vectors_to_quaternion(v1, v2, eps=1e-8, antiparallel_tolerance=1e-3):
     return torch.where(antiparallel, fallback, normalize_quaternion(raw))
 
 
-def valid_rotation_mask(p, lag=1, min_fraction=0.02):
+def valid_rotation_mask(p, lag=1, min_fraction=0.02, reference=None):
     """True where both endpoints of a transition carry a reliable direction.
 
     p is [..., T, 3]. A vector counts as reliable when its magnitude reaches
@@ -138,9 +138,14 @@ def valid_rotation_mask(p, lag=1, min_fraction=0.02):
     median rotation is 34 degrees against 10 for the rest -- noise, not physiology. At
     0.05 it already masks a quarter of every record (median 15 degrees), which reaches
     into genuine low-amplitude P and ST segments.
+
+    ``reference`` overrides the percentile, broadcast against [..., T]. Beat patches need
+    it: a patch's own percentile would call a quiet boundary interval reliable, so they
+    take the whole record's instead.
     """
     magnitude = _safe_norm(p)
-    reference = torch.quantile(magnitude.detach(), 0.99, dim=-1, keepdim=True)
+    if reference is None:
+        reference = torch.quantile(magnitude.detach(), 0.99, dim=-1, keepdim=True)
     reliable = magnitude >= min_fraction * reference
     return reliable[..., :-lag] & reliable[..., lag:]
 
