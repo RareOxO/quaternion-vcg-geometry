@@ -82,6 +82,10 @@ def run(config, records=256):
         beat_dt_ms = ((rr[beat_mask] - 1).clamp_min(1.0) / (steps * lvcg["fs"])) * 1000
         # omega is channel 5 of (q, theta, omega, mask) for the V2 feature set.
         beat_omega = beat_features[:, :, 5][beat_valid]
+        from qdg.delineate import delineate_record
+
+        delineated = [delineate_record(record, lvcg["fs"]) for record in ecg.numpy()]
+        phases = build_model(config, "V4").phase_masks(ecg)
     consecutive = (flipped[:, 1:] * flipped[:, :-1]).sum(-1)
     return {
         "edge_cases": _edge_cases(),
@@ -104,6 +108,23 @@ def run(config, records=256):
             ),
             "theta_deg_valid": _percentiles(torch.rad2deg(theta[mask])),
             "omega_rad_per_s_valid": _percentiles(theta[mask] / dt),
+        },
+        "phases_v4": {
+            "beats": int(sum(len(b["r_peak"]) for b in delineated)),
+            "valid_qrs_fraction": round(
+                sum(int(b["valid_qrs"].sum()) for b in delineated)
+                / sum(len(b["r_peak"]) for b in delineated),
+                4,
+            ),
+            "valid_t_fraction": round(
+                sum(int(b["valid_twave"].sum()) for b in delineated)
+                / sum(len(b["r_peak"]) for b in delineated),
+                4,
+            ),
+            "qrs_fraction_of_transitions": round(phases["qrs"].float().mean().item(), 4),
+            "t_fraction_of_transitions": round(phases["t"].float().mean().item(), 4),
+            "records_without_qrs": int((phases["qrs"].sum(-1) == 0).sum()),
+            "records_without_t": int((phases["t"].sum(-1) == 0).sum()),
         },
         "beat_level_v2": {
             "beats_shape": list(beats.shape),

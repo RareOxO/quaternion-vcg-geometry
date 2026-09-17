@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -55,7 +56,11 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("prepare", "profile", "sanity", "train", "evaluate", "tables"):
         sub = commands.add_parser(name)
-        sub.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+        # QLVCG_CONFIG lets a machine point every command at its own local config once,
+        # instead of editing the tracked one and colliding with every git pull.
+        sub.add_argument(
+            "--config", type=Path, default=os.environ.get("QLVCG_CONFIG", DEFAULT_CONFIG)
+        )
         if name == "profile":
             sub.add_argument("--experiment", choices=list(EXPERIMENTS), required=True)
         if name == "train":

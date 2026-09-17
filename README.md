@@ -291,7 +291,7 @@ Panel A, the R-peak-relative heatmap on one symmetric scale clipped at the 99th
 percentile; Panel B, DEP against REP density per disease and branch with patient
 bootstrap intervals; Panel C, the R/L/Q composition inside each phase.
 
-## Latent VCG track: B0, V0 and V1-V3 (supervised PTB-XL)
+## Latent VCG track: B0, V0 and V1-V4 (supervised PTB-XL)
 
 The second project line extends the Latent VCG framework (LVCG, ICML 2026) with
 Quaternion structure. Every model is trained from scratch, end to end, on the same PTB-XL
@@ -430,6 +430,58 @@ python -m qlvcg train --experiment V3vcgmag
 python -m qlvcg tables --root runs
 ```
 
+### V4 Phase-Q LVCG: quaternion dynamics by cardiac phase
+
+V4 asks whether the quaternion information sits in depolarisation or repolarisation.
+Beside V0's embedding it encodes q, theta, omega separately inside the QRS, inside the T
+interval, and over the whole record; the head reads the phases present. Phase boundaries
+come from the repository's existing delineator (`qdg/delineate.py`), as section J prefers,
+run unchanged on the same 100 Hz z-scored records: QRS = [QRS_on, QRS_off) of beats whose
+QRS passed QC, T = [QRS_off, T_end) of beats whose T wave passed. At 100 Hz it agrees with
+its own 500 Hz output to a median of 10-12 ms on QRS boundaries (one sample) and 6 ms on
+T end, with valid QRS 89.7% and valid T 75.1% of beats. A phase branch is V1's branch
+with the validity mask narrowed to the phase and pooling restricted to the phase's steps,
+so a phase's coverage does not scale its embedding; each single-phase arm has exactly V1's
+parameter count. The phase-restricted sequence still reveals the phase's extent (QRS
+width, repolarisation length) -- timing information that travels with it.
+
+| Experiment | Phases | Section J comparison |
+|---|---|---|
+| `V4whole` | whole | Whole -- read from the `V1` run, not trained |
+| `V4qrs` | qrs | QRS |
+| `V4t` | t | T |
+| `V4qrst` | qrs, t | QRS + T |
+| `V4` | qrs, t, whole | QRS + T + Whole |
+| `V4ctrl` | qrs, t, whole | real control on P_t, P_{t+1}, P_{t+1} - P_t |
+
+V4 adds 531,114 parameters (+6.4%) and about 45% step time over V0, most of it the CPU
+delineation.
+
+```bash
+python -m qlvcg train --experiment V4qrs
+python -m qlvcg train --experiment V4t
+python -m qlvcg train --experiment V4qrst
+python -m qlvcg train --experiment V4
+python -m qlvcg tables --root runs
+```
+
+### Machine-specific paths
+
+Keep the dataset path out of the tracked config, so `git pull` never collides with it:
+
+```bash
+cat > configs/lvcg_local.yaml <<'EOF'
+extends: lvcg.yaml
+data:
+  root: /absolute/path/to/ptb-xl/1.0.3
+EOF
+echo "configs/*_local.yaml" >> .git/info/exclude
+echo 'export QLVCG_CONFIG=configs/lvcg_local.yaml' >> ~/.bashrc
+```
+
+Every `qlvcg` command then reads it without `--config`. Only `data.root` changes, so the
+prepared cache is reused.
+
 Each `train` evaluates the validation-selected checkpoint on fold 10 once and appends a
 row to `results/quaternion_experiments.csv`. Runs limited with `--limit-train` /
 `--limit-val` never reach that file.
@@ -492,5 +544,5 @@ qdg/interpret.py      perturbation contributions on R-peak-relative time
 qdg/delineate.py      per-beat QRS onset/offset and T peak/end, with QC flags
 qdg/phases.py         contributions mapped onto DEP and REP, tables and the main figure
 lvcg/                 the author's LVCG release, vendored; lvcg/data reconstructed
-qlvcg/                B0, V0, V1-V3 supervised on PTB-XL, quaternion utilities, CLI
+qlvcg/                B0, V0, V1-V4 supervised on PTB-XL, quaternion utilities, CLI
 ```

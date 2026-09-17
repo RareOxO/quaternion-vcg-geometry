@@ -18,6 +18,9 @@ from qlvcg.models import (
     QDFLVCG,
     QDTLVCG,
     MRQLVCG,
+    DynamicEncoder,
+    PhaseMasks,
+    PhaseQLVCG,
     BeatQuaternionFeatures,
     SupervisedLVCG,
     build_model,
@@ -295,8 +298,9 @@ def test_v1_end_to_end_and_history_against_v0(synthetic_cache, tmp_path):
     v2_row = next(line for line in text.splitlines() if line.startswith("| V2 | qdt_lvcg |"))
     assert v2_row.split("|")[7].strip() != "-", "V2 must be compared with V1"
     v1_row = next(line for line in text.splitlines() if line.startswith("| V1 | qdf_lvcg | 42"))
-    reused = next(line for line in text.splitlines() if line.startswith("| V3vcgrot (= V1) |"))
-    assert v1_row.split("|")[4:] == reused.split("|")[4:], "V3 VCG+Rotation is read from V1"
+    for name in ("V3vcgrot", "V4whole"):
+        reused = next(line for line in text.splitlines() if line.startswith(f"| {name} (= V1) |"))
+        assert v1_row.split("|")[4:] == reused.split("|")[4:], f"{name} is read from V1"
 
 
 # --- V2 QDT-LVCG ---
@@ -537,3 +541,115 @@ def test_v3_shapes_are_recorded(config):
     only = record_shapes(build_model(config, "V3rot"), _ecg())
     assert "vcg (lift)" in only and "beat tokens (beat_encoder)" not in only
     assert isinstance(build_model(config, "V3"), MRQLVCG)
+
+
+# --- V4 Phase-Q LVCG ---
+
+V4_EXPERIMENTS = [name for name, spec in EXPERIMENTS.items() if spec["model"] == "phase_q_lvcg"]
+V4_TRAINED = [name for name in V4_EXPERIMENTS if not EXPERIMENTS[name].get("reuses")]
+
+
+def _planted_ecg(rate=100, beats=10):
+    from test_phases import _ecg as twelve_leads
+    from test_phases import _vcg as planted_vcg
+
+    vcg, peaks = planted_vcg(beats=beats, rate=rate)
+    return torch.as_tensor(twelve_leads(vcg))[None], peaks
+
+
+def test_v4_covers_the_section_j_comparisons():
+    phases = {name: EXPERIMENTS[name]["phases"] for name in V4_EXPERIMENTS}
+    assert {("whole",), ("qrs",), ("t",), ("qrs", "t"), ("qrs", "t", "whole")} <= set(
+        phases.values()
+    )
+    assert EXPERIMENTS["V4whole"]["reuses"] == "V1"
+    assert EXPERIMENTS["V4ctrl"]["features"] == ("position", "next_position", "delta")
+
+
+def test_whole_record_phase_is_v1(config):
+    v1, whole = build_model(config, "V1"), build_model(config, "V4whole")
+    assert v1.parameter_counts()["total"] == whole.parameter_counts()["total"]
+    ecg = _ecg()
+    features_v1, _ = v1.dynamics(v1.vcg(ecg))
+    features, pool_mask = whole.phase_features(ecg)["whole"]
+    torch.testing.assert_close(features, features_v1)
+    assert pool_mask is None
+    with pytest.raises(ValueError, match="same configuration as V1"):
+        train(config, "V4whole")
+
+
+def test_single_phases_have_v1_capacity(config):
+    v1 = build_model(config, "V1").parameter_counts()["total"]
+    for name in ("V4qrs", "V4t"):
+        assert build_model(config, name).parameter_counts()["total"] == v1
+    control = build_model(config, "V4ctrl").parameter_counts()["dynamic_branch"]
+    main = build_model(config, "V4").parameter_counts()["dynamic_branch"]
+    assert abs(control - main) / main < 0.02
+
+
+@pytest.mark.parametrize("experiment", V4_TRAINED)
+def test_v4_logits_and_gradients_are_finite(config, experiment):
+    torch.manual_seed(0)
+    model = build_model(config, experiment)
+    logits = model(_ecg())
+    assert logits.shape == (3, len(CLASSES)) and torch.isfinite(logits).all()
+    logits.square().mean().backward()
+    for encoder in model.phase_encoders.values():
+        assert all(
+            p.grad is not None and torch.isfinite(p.grad).all() for p in encoder.parameters()
+        )
+
+
+def test_phase_masks_follow_the_planted_beats():
+    ecg, peaks = _planted_ecg()
+    masks = PhaseMasks(100)(ecg)
+    qrs, t = masks["qrs"][0], masks["t"][0]
+    assert qrs.shape == (999,) and t.shape == (999,)
+    assert not (qrs & t).any(), "QRS and T are disjoint"
+    for peak in peaks:
+        assert qrs[peak], "every R peak lies inside its QRS"
+        assert t[peak + 24], "240 ms after R is repolarisation"
+        assert not t[peak - 1] and not qrs[peak + 24]
+
+
+@pytest.mark.parametrize("length", [999, 1000, 257, 64])
+def test_masked_pooling_matches_the_convolution_lengths(length):
+    torch.manual_seed(0)
+    encoder = DynamicEncoder(7).eval()
+    x = torch.randn(2, 7, length)
+    full = torch.ones(2, length, dtype=torch.bool)
+    torch.testing.assert_close(encoder(x, full), encoder(x))
+
+
+def test_masked_pooling_ignores_steps_far_outside_the_phase():
+    torch.manual_seed(0)
+    encoder = DynamicEncoder(7).eval()
+    x = torch.randn(1, 7, 999)
+    mask = torch.zeros(1, 999, dtype=torch.bool)
+    mask[:, 100:200] = True
+    changed = x.clone()
+    changed[:, :, 600:] = torch.randn(1, 7, 399)  # far beyond the receptive field
+    torch.testing.assert_close(encoder(x, mask), encoder(changed, mask))
+    empty = encoder(x, torch.zeros(1, 999, dtype=torch.bool))
+    assert torch.isfinite(empty).all()
+
+
+def test_phase_features_are_identity_outside_the_phase(config):
+    model = build_model(config, "V4qrs")
+    ecg, _ = _planted_ecg()
+    features, pool_mask = model.phase_features(standardize(ecg))["qrs"]
+    outside = ~pool_mask[0]
+    assert outside.any() and pool_mask[0].any()
+    rotation = features[0, :, outside]
+    torch.testing.assert_close(rotation[0].abs(), torch.ones_like(rotation[0]))  # |q_w|
+    assert rotation[1:4].abs().max() < 1e-6 and rotation[-1].abs().max() == 0  # q_xyz, mask
+    assert rotation[4].abs().max() < 1e-5  # theta: only the safe-norm floor
+
+
+def test_v4_shapes_are_recorded(config):
+    shapes = record_shapes(build_model(config, "V4"), _ecg())
+    assert shapes["qrs, t masks (phase_masks)"] == [[3, 999], [3, 999]]
+    for name in ("e_qrs", "e_t", "e_whole"):
+        assert shapes[name] == [[3, 128]]
+    assert shapes["logits (head)"] == [[3, len(CLASSES)]]
+    assert isinstance(build_model(config, "V4"), PhaseQLVCG)

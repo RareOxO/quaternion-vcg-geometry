@@ -16,7 +16,9 @@ fixed protocol for every later variant. Runs made before this change under the n
 ``V0A`` are exactly that configuration and are read as ``V0``.
 """
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from lvcg.data import get_lead_directions
@@ -25,6 +27,7 @@ from lvcg.models.lvcg import LVCG
 from lvcg.models.vcg import VCGPseudoInverse
 
 from qdg.data import CLASSES
+from qdg.delineate import delineate_record
 
 from .quaternion_utils import (
     _safe_norm,
@@ -116,6 +119,24 @@ EXPERIMENTS.update(
             **_V3,
             "variant": "mrq_real_control",
             "branches": ("vcg", "position", "delta"),
+        },
+    }
+)
+_V4 = {"model": "phase_q_lvcg", "report": "reports/V4_PHASEQ_report.md"}
+EXPERIMENTS.update(
+    {
+        # Section J's five comparisons. Whole is V1's branch on the whole record, so
+        # "Whole" alone is V1 and is read from that run.
+        "V4": {**_V4, "variant": "phase_q_lvcg", "phases": ("qrs", "t", "whole")},
+        "V4qrs": {**_V4, "variant": "phase_q_qrs", "phases": ("qrs",)},
+        "V4t": {**_V4, "variant": "phase_q_t", "phases": ("t",)},
+        "V4qrst": {**_V4, "variant": "phase_q_qrs_t", "phases": ("qrs", "t")},
+        "V4whole": {**_V4, "variant": "phase_q_whole", "phases": ("whole",), "reuses": "V1"},
+        "V4ctrl": {
+            **_V4,
+            "variant": "phase_q_real_control",
+            "phases": ("qrs", "t", "whole"),
+            "features": ("position", "next_position", "delta"),
         },
     }
 )
@@ -357,8 +378,24 @@ class DynamicEncoder(nn.Module):
         # LVCG layer-normalises each embedding part before concatenation; e_Q follows suit.
         self.norm = nn.LayerNorm(embedding_dim)
 
-    def forward(self, x):
-        return self.norm(self.dropout(self.net(x).mean(dim=-1)))
+    STRIDES = 3  # three stride-2 convolutions
+
+    def forward(self, x, pool_mask=None):
+        """Average over time; with ``pool_mask`` [B, T], over the masked steps only.
+
+        The mask is carried through the strides with max pooling, which reproduces each
+        convolution's output length exactly, so a pooled step counts when any input step
+        it summarises was inside the mask. A record whose mask is empty pools to zero.
+        """
+        h = self.net(x)
+        if pool_mask is None:
+            pooled = h.mean(dim=-1)
+        else:
+            m = pool_mask.unsqueeze(1).to(h.dtype)
+            for _ in range(self.STRIDES):
+                m = F.max_pool1d(m, kernel_size=2, stride=2, ceil_mode=True)
+            pooled = (h * m).sum(dim=-1) / m.sum(dim=-1).clamp_min(1.0)
+        return self.norm(self.dropout(pooled))
 
 
 class QDFLVCG(SupervisedLVCG):
@@ -539,6 +576,137 @@ class QDTLVCG(SupervisedLVCG):
         return counts
 
 
+class PhaseMasks(nn.Module):
+    """Per-transition QRS and T masks [B, T - 1] from the repository's existing delineator.
+
+    Section J asks for existing fiducials first, and ``qdg.delineate`` already delineates
+    every beat into QRS onset/offset and T peak/end with separate QC flags. It is used
+    unchanged -- R peaks from the Kors VCG magnitude, boundaries from its spatial
+    velocity -- on the same z-scored 100 Hz records the models see. Checked against its
+    own output at 500 Hz on 300 training records: valid QRS 89.7% vs 93.0%, valid T 75.1%
+    vs 76.0%; QRS onset and offset within a median 12 and 10 ms (one sample at 100 Hz),
+    T end within 6 ms. At 100 Hz the QRS comes out about one sample wider on each side
+    (median 100 ms against 76 ms at 500 Hz).
+
+        QRS  [QRS_on, QRS_off)   beats whose QRS passed QC
+        T    [QRS_off, T_end)    beats whose T wave passed QC -- the ST-T repolarisation
+
+    A transition t (samples t -> t+1) belongs to a phase when sample t does. Delineation
+    reads only the input ECG and has no parameters; it runs on the CPU, about 0.4 ms per
+    record.
+    """
+
+    PHASES = ("qrs", "t")
+
+    def __init__(self, fs):
+        super().__init__()
+        self.fs = int(fs)
+
+    @torch.no_grad()
+    def forward(self, ecg):
+        signals = ecg.detach().float().cpu().numpy()
+        batch, _, length = signals.shape
+        masks = {name: np.zeros((batch, length - 1), dtype=bool) for name in self.PHASES}
+        for row, signal in enumerate(signals):
+            beats = delineate_record(signal, self.fs)
+            for on, off, end, qrs_ok, t_ok in zip(
+                beats["qrs_on"],
+                beats["qrs_off"],
+                beats["t_end"],
+                beats["valid_qrs"],
+                beats["valid_twave"],
+            ):
+                if qrs_ok:
+                    masks["qrs"][row, on:off] = True
+                if t_ok:
+                    masks["t"][row, off:end] = True
+        return {name: torch.as_tensor(mask, device=ecg.device) for name, mask in masks.items()}
+
+
+class PhaseQLVCG(SupervisedLVCG):
+    """V4: quaternion dynamics encoded separately inside QRS, inside T, and over the whole record.
+
+        e_base    V0's LVCG embedding                                    640-d
+        e_QRS     q, theta, omega restricted to QRS  -> DynamicEncoder   128-d
+        e_T       q, theta, omega restricted to T    -> DynamicEncoder   128-d
+        e_global  q, theta, omega on the whole record -> DynamicEncoder  128-d (V1's branch)
+        logits = Linear([e_base ; present phases])
+
+    A phase branch computes exactly V1's features with the validity mask narrowed to the
+    phase: outside it the rotation is the identity, theta = omega = 0, and the mask
+    channel is 0. The encoder then averages over the phase's steps only, so how much of
+    the record a phase covers does not scale its embedding. The whole-record branch is
+    V1's unchanged, which makes the "Whole" comparison V1 itself.
+
+    What the phases cannot hide: a phase-restricted sequence shows where the phase is,
+    so e_QRS also sees QRS width and e_T repolarisation length. That is information about
+    timing, not rotation, and is worth remembering when a phase branch helps.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        lvcg,
+        phases,
+        features=("q", "theta", "omega"),
+        embedding_dim=128,
+        hidden=64,
+        kernel=7,
+        dropout=0.1,
+        min_magnitude_fraction=0.02,
+        sign_continuity=True,
+    ):
+        super().__init__(num_classes, **lvcg)
+        phases = tuple(phases)
+        if not phases or any(p not in ("qrs", "t", "whole") for p in phases):
+            raise ValueError(f"Invalid phase set {phases!r}")
+        self.phases = phases
+        self.features = _check_features(features)
+        self.dt = 1.0 / lvcg["fs"]
+        self.min_fraction = float(min_magnitude_fraction)
+        self.sign_continuity = bool(sign_continuity)
+        self.phase_masks = PhaseMasks(lvcg["fs"])
+        channels = sum(FEATURE_CHANNELS[f] for f in self.features) + 1
+        self.phase_encoders = nn.ModuleDict(
+            {
+                name: DynamicEncoder(channels, embedding_dim, hidden, kernel, dropout)
+                for name in phases
+            }
+        )
+        self.head = ClassificationHead(
+            "linear", self.backbone.out_features + embedding_dim * len(phases), num_classes
+        )
+        self.embedding_dim = embedding_dim
+
+    def phase_features(self, ecg):
+        """phase -> (features [B, C, T - 1], pooling mask [B, T - 1] or None)."""
+        p = self.vcg(ecg).transpose(1, 2)
+        valid = valid_rotation_mask(p, lag=1, min_fraction=self.min_fraction)
+        masks = self.phase_masks(ecg) if any(ph != "whole" for ph in self.phases) else {}
+        out = {}
+        for name in self.phases:
+            mask = valid if name == "whole" else valid & masks[name]
+            x = transition_features(p, mask, self.features, self.dt, self.sign_continuity)
+            out[name] = (x.transpose(1, 2), None if name == "whole" else masks[name])
+        return out
+
+    def forward(self, ecg):
+        parts = [self.backbone.forward_inference(ecg, use_all_leads=True)]
+        for name, (x, pool_mask) in self.phase_features(ecg).items():
+            parts.append(self.phase_encoders[name](x, pool_mask))
+        return self.head(torch.cat(parts, dim=-1))
+
+    def parameter_counts(self):
+        counts = super().parameter_counts()
+        head_per_phase = self.embedding_dim * self.head.net.out_features
+        for name in self.phases:
+            counts[f"{name}_branch"] = (
+                sum(p.numel() for p in self.phase_encoders[name].parameters()) + head_per_phase
+            )
+        counts["dynamic_branch"] = sum(counts[f"{name}_branch"] for name in self.phases)
+        return counts
+
+
 # V3 branches: the features each one encodes, and whether it also sees the validity mask.
 # The magnitude branch encodes r_t alone: the mask is a threshold on r_t, so it would add
 # nothing, and leaving it out makes the real-valued control match V3 channel for channel
@@ -713,6 +881,20 @@ def build_model(config, experiment):
             min_magnitude_fraction=settings["min_magnitude_fraction"],
             sign_continuity=settings["sign_continuity"],
         )
+    if kind == "phase_q_lvcg":
+        spec = EXPERIMENTS[experiment]
+        return PhaseQLVCG(
+            len(CLASSES),
+            config["model"]["lvcg"],
+            spec["phases"],
+            features=spec.get("features", ("q", "theta", "omega")),
+            embedding_dim=settings["embedding_dim"],
+            hidden=settings["hidden"],
+            kernel=settings["kernel"],
+            dropout=settings["dropout"],
+            min_magnitude_fraction=settings["min_magnitude_fraction"],
+            sign_continuity=settings["sign_continuity"],
+        )
     if kind == "mrq_lvcg":
         return MRQLVCG(
             len(CLASSES),
@@ -742,7 +924,10 @@ def record_shapes(model, ecg):
 
     def hook(name):
         def save(_module, _inputs, output):
-            items = output if isinstance(output, tuple) else (output,)
+            if isinstance(output, dict):
+                items = tuple(output.values())
+            else:
+                items = output if isinstance(output, tuple) else (output,)
             shapes[name] = [list(item.shape) for item in items if torch.is_tensor(item)]
 
         return save
@@ -770,6 +955,10 @@ def record_shapes(model, ecg):
         stages["beat features, mask (beat_dynamics)"] = model.beat_dynamics
         stages["z_Q valid beats (quaternion_beat_encoder)"] = model.quaternion_beat_encoder
         stages["fused tokens (fusion)"] = model.fusion
+    if isinstance(model, PhaseQLVCG):
+        stages["qrs, t masks (phase_masks)"] = model.phase_masks
+        for name in model.phases:
+            stages[f"e_{name}"] = model.phase_encoders[name]
     if isinstance(model, MRQLVCG):
         for name in model.extra:
             stages[f"{name} features, mask"] = model.branch_features[name]

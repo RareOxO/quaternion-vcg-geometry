@@ -71,6 +71,14 @@ model:
     dropout: 0.1
     min_magnitude_fraction: 0.02
     sign_continuity: true
+  # V4 Phase-Q LVCG: quaternion dynamics inside QRS, inside T, and over the whole record.
+  phase_q_lvcg:
+    embedding_dim: 128
+    hidden: 64
+    kernel: 7
+    dropout: 0.1
+    min_magnitude_fraction: 0.02
+    sign_continuity: true
 training:
   seed: 42
   epochs: 50
